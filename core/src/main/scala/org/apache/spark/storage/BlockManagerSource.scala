@@ -17,50 +17,48 @@
 
 package org.apache.spark.storage
 
-import com.codahale.metrics.{Gauge,MetricRegistry}
+import com.codahale.metrics.{Gauge, MetricRegistry}
 
-import org.apache.spark.SparkContext
 import org.apache.spark.metrics.source.Source
 
-private[spark] class BlockManagerSource(val blockManager: BlockManager, sc: SparkContext)
+private[spark] class BlockManagerSource(val blockManager: BlockManager)
     extends Source {
-  val metricRegistry = new MetricRegistry()
-  val sourceName = "%s.BlockManager".format(sc.appName)
+  override val metricRegistry = new MetricRegistry()
+  override val sourceName = "BlockManager"
 
-  metricRegistry.register(MetricRegistry.name("memory", "maxMem_MB"), new Gauge[Long] {
-    override def getValue: Long = {
-      val storageStatusList = blockManager.master.getStorageStatus
-      val maxMem = storageStatusList.map(_.maxMem).reduce(_ + _)
-      maxMem / 1024 / 1024
-    }
-  })
+  private def registerGauge(name: String, func: BlockManagerMaster => Long): Unit = {
+    metricRegistry.register(name, new Gauge[Long] {
+      override def getValue: Long = func(blockManager.master) / 1024 / 1024
+    })
+  }
 
-  metricRegistry.register(MetricRegistry.name("memory", "remainingMem_MB"), new Gauge[Long] {
-    override def getValue: Long = {
-      val storageStatusList = blockManager.master.getStorageStatus
-      val remainingMem = storageStatusList.map(_.memRemaining).reduce(_ + _)
-      remainingMem / 1024 / 1024
-    }
-  })
+  registerGauge(MetricRegistry.name("memory", "maxMem_MB"),
+    _.getStorageStatus.map(_.maxMem).sum)
 
-  metricRegistry.register(MetricRegistry.name("memory", "memUsed_MB"), new Gauge[Long] {
-    override def getValue: Long = {
-      val storageStatusList = blockManager.master.getStorageStatus
-      val maxMem = storageStatusList.map(_.maxMem).reduce(_ + _)
-      val remainingMem = storageStatusList.map(_.memRemaining).reduce(_ + _)
-      (maxMem - remainingMem) / 1024 / 1024
-    }
-  })
+  registerGauge(MetricRegistry.name("memory", "maxOnHeapMem_MB"),
+    _.getStorageStatus.map(_.maxOnHeapMem.getOrElse(0L)).sum)
 
-  metricRegistry.register(MetricRegistry.name("disk", "diskSpaceUsed_MB"), new Gauge[Long] {
-    override def getValue: Long = {
-      val storageStatusList = blockManager.master.getStorageStatus
-      val diskSpaceUsed = storageStatusList
-        .flatMap(_.blocks.values.map(_.diskSize))
-        .reduceOption(_ + _)
-        .getOrElse(0L)
+  registerGauge(MetricRegistry.name("memory", "maxOffHeapMem_MB"),
+    _.getStorageStatus.map(_.maxOffHeapMem.getOrElse(0L)).sum)
 
-      diskSpaceUsed / 1024 / 1024
-    }
-  })
+  registerGauge(MetricRegistry.name("memory", "remainingMem_MB"),
+    _.getStorageStatus.map(_.memRemaining).sum)
+
+  registerGauge(MetricRegistry.name("memory", "remainingOnHeapMem_MB"),
+    _.getStorageStatus.map(_.onHeapMemRemaining.getOrElse(0L)).sum)
+
+  registerGauge(MetricRegistry.name("memory", "remainingOffHeapMem_MB"),
+    _.getStorageStatus.map(_.offHeapMemRemaining.getOrElse(0L)).sum)
+
+  registerGauge(MetricRegistry.name("memory", "memUsed_MB"),
+    _.getStorageStatus.map(_.memUsed).sum)
+
+  registerGauge(MetricRegistry.name("memory", "onHeapMemUsed_MB"),
+    _.getStorageStatus.map(_.onHeapMemUsed.getOrElse(0L)).sum)
+
+  registerGauge(MetricRegistry.name("memory", "offHeapMemUsed_MB"),
+    _.getStorageStatus.map(_.offHeapMemUsed.getOrElse(0L)).sum)
+
+  registerGauge(MetricRegistry.name("disk", "diskSpaceUsed_MB"),
+    _.getStorageStatus.map(_.diskUsed).sum)
 }

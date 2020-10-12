@@ -19,12 +19,13 @@ package org.apache.spark.util.collection
 
 import scala.collection.mutable.HashSet
 
-import org.scalatest.FunSuite
-import org.scalatest.matchers.ShouldMatchers
+import org.scalatest.matchers.must.Matchers
+import org.scalatest.matchers.should.Matchers._
 
+import org.apache.spark.SparkFunSuite
 import org.apache.spark.util.SizeEstimator
 
-class PrimitiveKeyOpenHashMapSuite extends FunSuite with ShouldMatchers {
+class PrimitiveKeyOpenHashMapSuite extends SparkFunSuite with Matchers {
 
   test("size for specialized, primitive key, value (int, int)") {
     val capacity = 1024
@@ -44,13 +45,10 @@ class PrimitiveKeyOpenHashMapSuite extends FunSuite with ShouldMatchers {
     val goodMap3 = new PrimitiveKeyOpenHashMap[Int, Int](256)
     assert(goodMap3.size === 0)
     intercept[IllegalArgumentException] {
-      new PrimitiveKeyOpenHashMap[Int, Int](1 << 30) // Invalid map size: bigger than 2^29
+      new PrimitiveKeyOpenHashMap[Int, Int](1 << 30 + 1) // Invalid map size: bigger than 2^30
     }
     intercept[IllegalArgumentException] {
       new PrimitiveKeyOpenHashMap[Int, Int](-1)
-    }
-    intercept[IllegalArgumentException] {
-      new PrimitiveKeyOpenHashMap[Int, Int](0)
     }
   }
 
@@ -117,5 +115,12 @@ class PrimitiveKeyOpenHashMapSuite extends FunSuite with ShouldMatchers {
     for (i <- 1 to 100) {
       assert(map(i.toLong) === i.toString)
     }
+  }
+
+  test("contains") {
+    val map = new PrimitiveKeyOpenHashMap[Int, Int](1)
+    map(0) = 0
+    assert(map.contains(0))
+    assert(!map.contains(1))
   }
 }

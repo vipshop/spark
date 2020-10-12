@@ -18,235 +18,334 @@
 package org.apache.spark.broadcast
 
 import java.io._
+import java.lang.ref.SoftReference
+import java.nio.ByteBuffer
+import java.util.zip.Adler32
 
-import scala.math
+import scala.collection.JavaConverters._
+import scala.reflect.ClassTag
 import scala.util.Random
 
 import org.apache.spark._
-import org.apache.spark.storage.{BroadcastBlockId, BroadcastHelperBlockId, StorageLevel}
-import org.apache.spark.util.Utils
-
-private[spark] class TorrentBroadcast[T](@transient var value_ : T, isLocal: Boolean, id: Long)
-extends Broadcast[T](id) with Logging with Serializable {
-
-  def value = value_
-
-  def broadcastId = BroadcastBlockId(id)
-
-  TorrentBroadcast.synchronized {
-    SparkEnv.get.blockManager.putSingle(broadcastId, value_, StorageLevel.MEMORY_AND_DISK, false)
-  }
-
-  @transient var arrayOfBlocks: Array[TorrentBlock] = null
-  @transient var totalBlocks = -1
-  @transient var totalBytes = -1
-  @transient var hasBlocks = 0
-
-  if (!isLocal) {
-    sendBroadcast()
-  }
-
-  def sendBroadcast() {
-    var tInfo = TorrentBroadcast.blockifyObject(value_)
-
-    totalBlocks = tInfo.totalBlocks
-    totalBytes = tInfo.totalBytes
-    hasBlocks = tInfo.totalBlocks
-
-    // Store meta-info
-    val metaId = BroadcastHelperBlockId(broadcastId, "meta")
-    val metaInfo = TorrentInfo(null, totalBlocks, totalBytes)
-    TorrentBroadcast.synchronized {
-      SparkEnv.get.blockManager.putSingle(
-        metaId, metaInfo, StorageLevel.MEMORY_AND_DISK, true)
-    }
-
-    // Store individual pieces
-    for (i <- 0 until totalBlocks) {
-      val pieceId = BroadcastHelperBlockId(broadcastId, "piece" + i)
-      TorrentBroadcast.synchronized {
-        SparkEnv.get.blockManager.putSingle(
-          pieceId, tInfo.arrayOfBlocks(i), StorageLevel.MEMORY_AND_DISK, true)
-      }
-    }
-  }
-
-  // Called by JVM when deserializing an object
-  private def readObject(in: ObjectInputStream) {
-    in.defaultReadObject()
-    TorrentBroadcast.synchronized {
-      SparkEnv.get.blockManager.getSingle(broadcastId) match {
-        case Some(x) =>
-          value_ = x.asInstanceOf[T]
-
-        case None =>
-          val start = System.nanoTime
-          logInfo("Started reading broadcast variable " + id)
-
-          // Initialize @transient variables that will receive garbage values from the master.
-          resetWorkerVariables()
-
-          if (receiveBroadcast(id)) {
-            value_ = TorrentBroadcast.unBlockifyObject[T](arrayOfBlocks, totalBytes, totalBlocks)
-
-            // Store the merged copy in cache so that the next worker doesn't need to rebuild it.
-            // This creates a tradeoff between memory usage and latency.
-            // Storing copy doubles the memory footprint; not storing doubles deserialization cost.
-            SparkEnv.get.blockManager.putSingle(
-              broadcastId, value_, StorageLevel.MEMORY_AND_DISK, false)
-
-            // Remove arrayOfBlocks from memory once value_ is on local cache
-            resetWorkerVariables()
-          }  else {
-            logError("Reading broadcast variable " + id + " failed")
-          }
-
-          val time = (System.nanoTime - start) / 1e9
-          logInfo("Reading broadcast variable " + id + " took " + time + " s")
-      }
-    }
-  }
-
-  private def resetWorkerVariables() {
-    arrayOfBlocks = null
-    totalBytes = -1
-    totalBlocks = -1
-    hasBlocks = 0
-  }
-
-  def receiveBroadcast(variableID: Long): Boolean = {
-    // Receive meta-info
-    val metaId = BroadcastHelperBlockId(broadcastId, "meta")
-    var attemptId = 10
-    while (attemptId > 0 && totalBlocks == -1) {
-      TorrentBroadcast.synchronized {
-        SparkEnv.get.blockManager.getSingle(metaId) match {
-          case Some(x) =>
-            val tInfo = x.asInstanceOf[TorrentInfo]
-            totalBlocks = tInfo.totalBlocks
-            totalBytes = tInfo.totalBytes
-            arrayOfBlocks = new Array[TorrentBlock](totalBlocks)
-            hasBlocks = 0
-
-          case None =>
-            Thread.sleep(500)
-        }
-      }
-      attemptId -= 1
-    }
-    if (totalBlocks == -1) {
-      return false
-    }
-
-    // Receive actual blocks
-    val recvOrder = new Random().shuffle(Array.iterate(0, totalBlocks)(_ + 1).toList)
-    for (pid <- recvOrder) {
-      val pieceId = BroadcastHelperBlockId(broadcastId, "piece" + pid)
-      TorrentBroadcast.synchronized {
-        SparkEnv.get.blockManager.getSingle(pieceId) match {
-          case Some(x) =>
-            arrayOfBlocks(pid) = x.asInstanceOf[TorrentBlock]
-            hasBlocks += 1
-            SparkEnv.get.blockManager.putSingle(
-              pieceId, arrayOfBlocks(pid), StorageLevel.MEMORY_AND_DISK, true)
-
-          case None =>
-            throw new SparkException("Failed to get " + pieceId + " of " + broadcastId)
-        }
-      }
-    }
-
-    (hasBlocks == totalBlocks)
-  }
-
-}
-
-private object TorrentBroadcast
-extends Logging {
-
-  private var initialized = false
-  private var conf: SparkConf = null
-  def initialize(_isDriver: Boolean, conf: SparkConf) {
-    TorrentBroadcast.conf = conf //TODO: we might have to fix it in tests
-    synchronized {
-      if (!initialized) {
-        initialized = true
-      }
-    }
-  }
-
-  def stop() {
-    initialized = false
-  }
-
-  lazy val BLOCK_SIZE = conf.getInt("spark.broadcast.blockSize", 4096) * 1024
-
-  def blockifyObject[T](obj: T): TorrentInfo = {
-    val byteArray = Utils.serialize[T](obj)
-    val bais = new ByteArrayInputStream(byteArray)
-
-    var blockNum = (byteArray.length / BLOCK_SIZE)
-    if (byteArray.length % BLOCK_SIZE != 0) {
-      blockNum += 1
-    }
-
-    var retVal = new Array[TorrentBlock](blockNum)
-    var blockID = 0
-
-    for (i <- 0 until (byteArray.length, BLOCK_SIZE)) {
-      val thisBlockSize = math.min(BLOCK_SIZE, byteArray.length - i)
-      var tempByteArray = new Array[Byte](thisBlockSize)
-      val hasRead = bais.read(tempByteArray, 0, thisBlockSize)
-
-      retVal(blockID) = new TorrentBlock(blockID, tempByteArray)
-      blockID += 1
-    }
-    bais.close()
-
-    val tInfo = TorrentInfo(retVal, blockNum, byteArray.length)
-    tInfo.hasBlocks = blockNum
-
-    tInfo
-  }
-
-  def unBlockifyObject[T](arrayOfBlocks: Array[TorrentBlock],
-                            totalBytes: Int,
-                            totalBlocks: Int): T = {
-    val retByteArray = new Array[Byte](totalBytes)
-    for (i <- 0 until totalBlocks) {
-      System.arraycopy(arrayOfBlocks(i).byteArray, 0, retByteArray,
-        i * BLOCK_SIZE, arrayOfBlocks(i).byteArray.length)
-    }
-    Utils.deserialize[T](retByteArray, Thread.currentThread.getContextClassLoader)
-  }
-
-}
-
-private[spark] case class TorrentBlock(
-    blockID: Int,
-    byteArray: Array[Byte])
-  extends Serializable
-
-private[spark] case class TorrentInfo(
-    @transient arrayOfBlocks : Array[TorrentBlock],
-    totalBlocks: Int,
-    totalBytes: Int)
-  extends Serializable {
-
-  @transient var hasBlocks = 0
-}
+import org.apache.spark.internal.{config, Logging}
+import org.apache.spark.io.CompressionCodec
+import org.apache.spark.serializer.Serializer
+import org.apache.spark.storage._
+import org.apache.spark.util.{KeyLock, Utils}
+import org.apache.spark.util.io.{ChunkedByteBuffer, ChunkedByteBufferOutputStream}
 
 /**
- * A [[BroadcastFactory]] that creates a torrent-based implementation of broadcast.
+ * A BitTorrent-like implementation of [[org.apache.spark.broadcast.Broadcast]].
+ *
+ * The mechanism is as follows:
+ *
+ * The driver divides the serialized object into small chunks and
+ * stores those chunks in the BlockManager of the driver.
+ *
+ * On each executor, the executor first attempts to fetch the object from its BlockManager. If
+ * it does not exist, it then uses remote fetches to fetch the small chunks from the driver and/or
+ * other executors if available. Once it gets the chunks, it puts the chunks in its own
+ * BlockManager, ready for other executors to fetch from.
+ *
+ * This prevents the driver from being the bottleneck in sending out multiple copies of the
+ * broadcast data (one per executor).
+ *
+ * When initialized, TorrentBroadcast objects read SparkEnv.get.conf.
+ *
+ * @param obj object to broadcast
+ * @param id A unique identifier for the broadcast variable.
  */
-class TorrentBroadcastFactory extends BroadcastFactory {
+private[spark] class TorrentBroadcast[T: ClassTag](obj: T, id: Long)
+  extends Broadcast[T](id) with Logging with Serializable {
 
-  def initialize(isDriver: Boolean, conf: SparkConf, securityMgr: SecurityManager) { 
-    TorrentBroadcast.initialize(isDriver, conf) 
+  /**
+   * Value of the broadcast object on executors. This is reconstructed by [[readBroadcastBlock]],
+   * which builds this value by reading blocks from the driver and/or other executors.
+   *
+   * On the driver, if the value is required, it is read lazily from the block manager. We hold
+   * a soft reference so that it can be garbage collected if required, as we can always reconstruct
+   * in the future.
+   */
+  @transient private var _value: SoftReference[T] = _
+
+  /** The compression codec to use, or None if compression is disabled */
+  @transient private var compressionCodec: Option[CompressionCodec] = _
+  /** Size of each block. Default value is 4MB.  This value is only read by the broadcaster. */
+  @transient private var blockSize: Int = _
+
+  private def setConf(conf: SparkConf): Unit = {
+    compressionCodec = if (conf.get(config.BROADCAST_COMPRESS)) {
+      Some(CompressionCodec.createCodec(conf))
+    } else {
+      None
+    }
+    // Note: use getSizeAsKb (not bytes) to maintain compatibility if no units are provided
+    blockSize = conf.get(config.BROADCAST_BLOCKSIZE).toInt * 1024
+    checksumEnabled = conf.get(config.BROADCAST_CHECKSUM)
+  }
+  setConf(SparkEnv.get.conf)
+
+  private val broadcastId = BroadcastBlockId(id)
+
+  /** Total number of blocks this broadcast variable contains. */
+  private val numBlocks: Int = writeBlocks(obj)
+
+  /** Whether to generate checksum for blocks or not. */
+  private var checksumEnabled: Boolean = false
+  /** The checksum for all the blocks. */
+  private var checksums: Array[Int] = _
+
+  override protected def getValue() = synchronized {
+    val memoized: T = if (_value == null) null.asInstanceOf[T] else _value.get
+    if (memoized != null) {
+      memoized
+    } else {
+      val newlyRead = readBroadcastBlock()
+      _value = new SoftReference[T](newlyRead)
+      newlyRead
+    }
   }
 
-  def newBroadcast[T](value_ : T, isLocal: Boolean, id: Long) =
-    new TorrentBroadcast[T](value_, isLocal, id)
+  private def calcChecksum(block: ByteBuffer): Int = {
+    val adler = new Adler32()
+    if (block.hasArray) {
+      adler.update(block.array, block.arrayOffset + block.position(), block.limit()
+        - block.position())
+    } else {
+      val bytes = new Array[Byte](block.remaining())
+      block.duplicate.get(bytes)
+      adler.update(bytes)
+    }
+    adler.getValue.toInt
+  }
 
-  def stop() { TorrentBroadcast.stop() }
+  /**
+   * Divide the object into multiple blocks and put those blocks in the block manager.
+   *
+   * @param value the object to divide
+   * @return number of blocks this broadcast variable is divided into
+   */
+  private def writeBlocks(value: T): Int = {
+    import StorageLevel._
+    // Store a copy of the broadcast variable in the driver so that tasks run on the driver
+    // do not create a duplicate copy of the broadcast variable's value.
+    val blockManager = SparkEnv.get.blockManager
+    if (!blockManager.putSingle(broadcastId, value, MEMORY_AND_DISK, tellMaster = false)) {
+      throw new SparkException(s"Failed to store $broadcastId in BlockManager")
+    }
+    try {
+      val blocks =
+        TorrentBroadcast.blockifyObject(value, blockSize, SparkEnv.get.serializer, compressionCodec)
+      if (checksumEnabled) {
+        checksums = new Array[Int](blocks.length)
+      }
+      blocks.zipWithIndex.foreach { case (block, i) =>
+        if (checksumEnabled) {
+          checksums(i) = calcChecksum(block)
+        }
+        val pieceId = BroadcastBlockId(id, "piece" + i)
+        val bytes = new ChunkedByteBuffer(block.duplicate())
+        if (!blockManager.putBytes(pieceId, bytes, MEMORY_AND_DISK_SER, tellMaster = true)) {
+          throw new SparkException(s"Failed to store $pieceId of $broadcastId " +
+            s"in local BlockManager")
+        }
+      }
+      blocks.length
+    } catch {
+      case t: Throwable =>
+        logError(s"Store broadcast $broadcastId fail, remove all pieces of the broadcast")
+        blockManager.removeBroadcast(id, tellMaster = true)
+        throw t
+    }
+  }
+
+  /** Fetch torrent blocks from the driver and/or other executors. */
+  private def readBlocks(): Array[BlockData] = {
+    // Fetch chunks of data. Note that all these chunks are stored in the BlockManager and reported
+    // to the driver, so other executors can pull these chunks from this executor as well.
+    val blocks = new Array[BlockData](numBlocks)
+    val bm = SparkEnv.get.blockManager
+
+    for (pid <- Random.shuffle(Seq.range(0, numBlocks))) {
+      val pieceId = BroadcastBlockId(id, "piece" + pid)
+      logDebug(s"Reading piece $pieceId of $broadcastId")
+      // First try getLocalBytes because there is a chance that previous attempts to fetch the
+      // broadcast blocks have already fetched some of the blocks. In that case, some blocks
+      // would be available locally (on this executor).
+      bm.getLocalBytes(pieceId) match {
+        case Some(block) =>
+          blocks(pid) = block
+          releaseBlockManagerLock(pieceId)
+        case None =>
+          bm.getRemoteBytes(pieceId) match {
+            case Some(b) =>
+              if (checksumEnabled) {
+                val sum = calcChecksum(b.chunks(0))
+                if (sum != checksums(pid)) {
+                  throw new SparkException(s"corrupt remote block $pieceId of $broadcastId:" +
+                    s" $sum != ${checksums(pid)}")
+                }
+              }
+              // We found the block from remote executors/driver's BlockManager, so put the block
+              // in this executor's BlockManager.
+              if (!bm.putBytes(pieceId, b, StorageLevel.MEMORY_AND_DISK_SER, tellMaster = true)) {
+                throw new SparkException(
+                  s"Failed to store $pieceId of $broadcastId in local BlockManager")
+              }
+              blocks(pid) = new ByteBufferBlockData(b, true)
+            case None =>
+              throw new SparkException(s"Failed to get $pieceId of $broadcastId")
+          }
+      }
+    }
+    blocks
+  }
+
+  /**
+   * Remove all persisted state associated with this Torrent broadcast on the executors.
+   */
+  override protected def doUnpersist(blocking: Boolean): Unit = {
+    TorrentBroadcast.unpersist(id, removeFromDriver = false, blocking)
+  }
+
+  /**
+   * Remove all persisted state associated with this Torrent broadcast on the executors
+   * and driver.
+   */
+  override protected def doDestroy(blocking: Boolean): Unit = {
+    TorrentBroadcast.unpersist(id, removeFromDriver = true, blocking)
+  }
+
+  /** Used by the JVM when serializing this object. */
+  private def writeObject(out: ObjectOutputStream): Unit = Utils.tryOrIOException {
+    assertValid()
+    out.defaultWriteObject()
+  }
+
+  private def readBroadcastBlock(): T = Utils.tryOrIOException {
+    TorrentBroadcast.torrentBroadcastLock.withLock(broadcastId) {
+      // As we only lock based on `broadcastId`, whenever using `broadcastCache`, we should only
+      // touch `broadcastId`.
+      val broadcastCache = SparkEnv.get.broadcastManager.cachedValues
+
+      Option(broadcastCache.get(broadcastId)).map(_.asInstanceOf[T]).getOrElse {
+        setConf(SparkEnv.get.conf)
+        val blockManager = SparkEnv.get.blockManager
+        blockManager.getLocalValues(broadcastId) match {
+          case Some(blockResult) =>
+            if (blockResult.data.hasNext) {
+              val x = blockResult.data.next().asInstanceOf[T]
+              releaseBlockManagerLock(broadcastId)
+
+              if (x != null) {
+                broadcastCache.put(broadcastId, x)
+              }
+
+              x
+            } else {
+              throw new SparkException(s"Failed to get locally stored broadcast data: $broadcastId")
+            }
+          case None =>
+            val estimatedTotalSize = Utils.bytesToString(numBlocks * blockSize)
+            logInfo(s"Started reading broadcast variable $id with $numBlocks pieces " +
+              s"(estimated total size $estimatedTotalSize)")
+            val startTimeNs = System.nanoTime()
+            val blocks = readBlocks()
+            logInfo(s"Reading broadcast variable $id took ${Utils.getUsedTimeNs(startTimeNs)}")
+
+            try {
+              val obj = TorrentBroadcast.unBlockifyObject[T](
+                blocks.map(_.toInputStream()), SparkEnv.get.serializer, compressionCodec)
+              // Store the merged copy in BlockManager so other tasks on this executor don't
+              // need to re-fetch it.
+              val storageLevel = StorageLevel.MEMORY_AND_DISK
+              if (!blockManager.putSingle(broadcastId, obj, storageLevel, tellMaster = false)) {
+                throw new SparkException(s"Failed to store $broadcastId in BlockManager")
+              }
+
+              if (obj != null) {
+                broadcastCache.put(broadcastId, obj)
+              }
+
+              obj
+            } finally {
+              blocks.foreach(_.dispose())
+            }
+        }
+      }
+    }
+  }
+
+  /**
+   * If running in a task, register the given block's locks for release upon task completion.
+   * Otherwise, if not running in a task then immediately release the lock.
+   */
+  private def releaseBlockManagerLock(blockId: BlockId): Unit = {
+    val blockManager = SparkEnv.get.blockManager
+    Option(TaskContext.get()) match {
+      case Some(taskContext) =>
+        taskContext.addTaskCompletionListener[Unit](_ => blockManager.releaseLock(blockId))
+      case None =>
+        // This should only happen on the driver, where broadcast variables may be accessed
+        // outside of running tasks (e.g. when computing rdd.partitions()). In order to allow
+        // broadcast variables to be garbage collected we need to free the reference here
+        // which is slightly unsafe but is technically okay because broadcast variables aren't
+        // stored off-heap.
+        blockManager.releaseLock(blockId)
+    }
+  }
+
+}
+
+
+private object TorrentBroadcast extends Logging {
+
+  /**
+   * A [[KeyLock]] whose key is [[BroadcastBlockId]] to ensure there is only one thread fetching
+   * the same [[TorrentBroadcast]] block.
+   */
+  private val torrentBroadcastLock = new KeyLock[BroadcastBlockId]
+
+  def blockifyObject[T: ClassTag](
+      obj: T,
+      blockSize: Int,
+      serializer: Serializer,
+      compressionCodec: Option[CompressionCodec]): Array[ByteBuffer] = {
+    val cbbos = new ChunkedByteBufferOutputStream(blockSize, ByteBuffer.allocate)
+    val out = compressionCodec.map(c => c.compressedOutputStream(cbbos)).getOrElse(cbbos)
+    val ser = serializer.newInstance()
+    val serOut = ser.serializeStream(out)
+    Utils.tryWithSafeFinally {
+      serOut.writeObject[T](obj)
+    } {
+      serOut.close()
+    }
+    cbbos.toChunkedByteBuffer.getChunks()
+  }
+
+  def unBlockifyObject[T: ClassTag](
+      blocks: Array[InputStream],
+      serializer: Serializer,
+      compressionCodec: Option[CompressionCodec]): T = {
+    require(blocks.nonEmpty, "Cannot unblockify an empty array of blocks")
+    val is = new SequenceInputStream(blocks.iterator.asJavaEnumeration)
+    val in: InputStream = compressionCodec.map(c => c.compressedInputStream(is)).getOrElse(is)
+    val ser = serializer.newInstance()
+    val serIn = ser.deserializeStream(in)
+    val obj = Utils.tryWithSafeFinally {
+      serIn.readObject[T]()
+    } {
+      serIn.close()
+    }
+    obj
+  }
+
+  /**
+   * Remove all persisted blocks associated with this torrent broadcast on the executors.
+   * If removeFromDriver is true, also remove these persisted blocks on the driver.
+   */
+  def unpersist(id: Long, removeFromDriver: Boolean, blocking: Boolean): Unit = {
+    logDebug(s"Unpersisting TorrentBroadcast $id")
+    SparkEnv.get.blockManager.master.removeBroadcast(id, removeFromDriver, blocking)
+  }
 }

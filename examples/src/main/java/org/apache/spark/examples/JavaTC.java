@@ -17,19 +17,22 @@
 
 package org.apache.spark.examples;
 
-import scala.Tuple2;
-import org.apache.spark.api.java.JavaPairRDD;
-import org.apache.spark.api.java.JavaSparkContext;
-import org.apache.spark.api.java.function.PairFunction;
-
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Random;
 import java.util.Set;
 
+import scala.Tuple2;
+
+import org.apache.spark.api.java.JavaPairRDD;
+import org.apache.spark.api.java.JavaSparkContext;
+import org.apache.spark.api.java.function.PairFunction;
+import org.apache.spark.sql.SparkSession;
+
 /**
  * Transitive closure on a graph, implemented in Java.
+ * Usage: JavaTC [partitions]
  */
 public final class JavaTC {
 
@@ -38,16 +41,16 @@ public final class JavaTC {
   private static final Random rand = new Random(42);
 
   static List<Tuple2<Integer, Integer>> generateGraph() {
-    Set<Tuple2<Integer, Integer>> edges = new HashSet<Tuple2<Integer, Integer>>(numEdges);
+    Set<Tuple2<Integer, Integer>> edges = new HashSet<>(numEdges);
     while (edges.size() < numEdges) {
       int from = rand.nextInt(numVertices);
       int to = rand.nextInt(numVertices);
-      Tuple2<Integer, Integer> e = new Tuple2<Integer, Integer>(from, to);
+      Tuple2<Integer, Integer> e = new Tuple2<>(from, to);
       if (from != to) {
         edges.add(e);
       }
     }
-    return new ArrayList<Tuple2<Integer, Integer>>(edges);
+    return new ArrayList<>(edges);
   }
 
   static class ProjectFn implements PairFunction<Tuple2<Integer, Tuple2<Integer, Integer>>,
@@ -56,20 +59,20 @@ public final class JavaTC {
 
     @Override
     public Tuple2<Integer, Integer> call(Tuple2<Integer, Tuple2<Integer, Integer>> triple) {
-      return new Tuple2<Integer, Integer>(triple._2()._2(), triple._2()._1());
+      return new Tuple2<>(triple._2()._2(), triple._2()._1());
     }
   }
 
   public static void main(String[] args) {
-    if (args.length == 0) {
-      System.err.println("Usage: JavaTC <host> [<slices>]");
-      System.exit(1);
-    }
+    SparkSession spark = SparkSession
+      .builder()
+      .appName("JavaTC")
+      .getOrCreate();
 
-    JavaSparkContext sc = new JavaSparkContext(args[0], "JavaTC",
-        System.getenv("SPARK_HOME"), JavaSparkContext.jarOfClass(JavaTC.class));
-    Integer slices = (args.length > 1) ? Integer.parseInt(args[1]): 2;
-    JavaPairRDD<Integer, Integer> tc = sc.parallelizePairs(generateGraph(), slices).cache();
+    JavaSparkContext jsc = new JavaSparkContext(spark.sparkContext());
+
+    int slices = (args.length > 0) ? Integer.parseInt(args[0]): 2;
+    JavaPairRDD<Integer, Integer> tc = jsc.parallelizePairs(generateGraph(), slices).cache();
 
     // Linear transitive closure: each round grows paths by one edge,
     // by joining the graph's edges with the already-discovered paths.
@@ -77,15 +80,9 @@ public final class JavaTC {
     // the graph to obtain the path (x, z).
 
     // Because join() joins on keys, the edges are stored in reversed order.
-    JavaPairRDD<Integer, Integer> edges = tc.mapToPair(
-      new PairFunction<Tuple2<Integer, Integer>, Integer, Integer>() {
-        @Override
-        public Tuple2<Integer, Integer> call(Tuple2<Integer, Integer> e) {
-          return new Tuple2<Integer, Integer>(e._2(), e._1());
-        }
-    });
+    JavaPairRDD<Integer, Integer> edges = tc.mapToPair(e -> new Tuple2<>(e._2(), e._1()));
 
-    long oldCount = 0;
+    long oldCount;
     long nextCount = tc.count();
     do {
       oldCount = nextCount;
@@ -96,6 +93,6 @@ public final class JavaTC {
     } while (nextCount != oldCount);
 
     System.out.println("TC has " + tc.count() + " edges.");
-    System.exit(0);
+    spark.stop();
   }
 }

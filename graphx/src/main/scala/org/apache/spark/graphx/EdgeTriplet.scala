@@ -27,17 +27,17 @@ class EdgeTriplet[VD, ED] extends Edge[ED] {
   /**
    * The source vertex attribute
    */
-  var srcAttr: VD = _ //nullValue[VD]
+  var srcAttr: VD = _ // nullValue[VD]
 
   /**
    * The destination vertex attribute
    */
-  var dstAttr: VD = _ //nullValue[VD]
+  var dstAttr: VD = _ // nullValue[VD]
 
   /**
    * Set the edge properties of this triplet.
    */
-  protected[spark] def set(other: Edge[ED]): EdgeTriplet[VD,ED] = {
+  protected[spark] def set(other: Edge[ED]): EdgeTriplet[VD, ED] = {
     srcId = other.srcId
     dstId = other.dstId
     attr = other.attr
@@ -62,5 +62,7 @@ class EdgeTriplet[VD, ED] extends Edge[ED] {
   def vertexAttr(vid: VertexId): VD =
     if (srcId == vid) srcAttr else { assert(dstId == vid); dstAttr }
 
-  override def toString = ((srcId, srcAttr), (dstId, dstAttr), attr).toString()
+  override def toString: String = ((srcId, srcAttr), (dstId, dstAttr), attr).toString()
+
+  def toTuple: ((VertexId, VD), (VertexId, VD), ED) = ((srcId, srcAttr), (dstId, dstAttr), attr)
 }

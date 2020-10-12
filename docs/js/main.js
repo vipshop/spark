@@ -1,3 +1,23 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* Custom JavaScript code in the MarkDown docs */
+
+// Enable language-specific code tabs
 function codeTabs() {
   var counter = 0;
   var langImages = {
@@ -9,7 +29,7 @@ function codeTabs() {
     $(this).addClass("tab-content");
 
     // Insert the tab bar
-    var tabBar = $('<ul class="nav nav-tabs" data-tabs="tabs"></ul>');
+    var tabBar = $('<ul class="nav nav-tabs mb-4" data-tabs="tabs" role="tablist"></ul>');
     $(this).before(tabBar);
 
     // Add each code sample to the tab bar:
@@ -30,12 +50,12 @@ function codeTabs() {
         var buttonLabel = ""
       }
       tabBar.append(
-        '<li><a class="tab_' + lang + '" href="#' + id + '">' + buttonLabel + '</a></li>'
+        '<li class="nav-item"><a class="nav-link tab_' + lang + '" href="#' + id + '" data-toggle="tab">' + buttonLabel + '</a></li>'
       );
     });
 
     codeSamples.first().addClass("active");
-    tabBar.children("li").first().addClass("active");
+    tabBar.children("li").first().children("a").first().addClass("active");
     counter++;
   });
   $("ul.nav-tabs a").click(function (e) {
@@ -48,33 +68,58 @@ function codeTabs() {
   });
 }
 
-function makeCollapsable(elt, accordionClass, accordionBodyId, title) {
-  $(elt).addClass("accordion-inner");
-  $(elt).wrap('<div class="accordion ' + accordionClass + '"></div>')
-  $(elt).wrap('<div class="accordion-group"></div>')
-  $(elt).wrap('<div id="' + accordionBodyId + '" class="accordion-body collapse"></div>')
-  $(elt).parent().before(
-    '<div class="accordion-heading">' +
-      '<a class="accordion-toggle" data-toggle="collapse" href="#' + accordionBodyId + '">' +
-             title +
-      '</a>' +
-    '</div>'
-  );
-}
 
-function viewSolution() {
-  var counter = 0
-  $("div.solution").each(function() {
-    var id = "solution_" + counter
-    makeCollapsable(this, "", id,
-      '<i class="icon-ok-sign" style="text-decoration: none; color: #0088cc">' +
-      '</i>' + "View Solution");
-    counter++;
-  });
+// A script to fix internal hash links because we have an overlapping top bar.
+// Based on https://github.com/twitter/bootstrap/issues/193#issuecomment-2281510
+function maybeScrollToHash() {
+  if (window.location.hash && $(window.location.hash).length) {
+    var newTop = $(window.location.hash).offset().top - 57;
+    $(window).scrollTop(newTop);
+  }
 }
-
 
 $(function() {
   codeTabs();
-  viewSolution();
+  // Display anchor links when hovering over headers. For documentation of the
+  // configuration options, see the AnchorJS documentation.
+  anchors.options = {
+    placement: 'right'
+  };
+  anchors.add();
+
+  $(window).bind('hashchange', function() {
+    maybeScrollToHash();
+  });
+
+  // Scroll now too in case we had opened the page on a hash, but wait a bit because some browsers
+  // will try to do *their* initial scroll after running the onReady handler.
+  $(window).on('load', function() { setTimeout(function() { maybeScrollToHash(); }, 25); });
+
+  // Make dropdown menus in nav bars show on hover instead of click
+  // using solution at https://webdesign.tutsplus.com/tutorials/how-
+  // to-make-the-bootstrap-navbar-dropdown-work-on-hover--cms-33840
+  const $dropdown = $(".dropdown");
+  const $dropdownToggle = $(".dropdown-toggle");
+  const $dropdownMenu = $(".dropdown-menu");
+  const showClass = "show";
+  $(window).on("load resize", function() {
+    if (this.matchMedia("(min-width: 768px)").matches) {
+      $dropdown.hover(
+        function() {
+          const $this = $(this);
+          $this.addClass(showClass);
+          $this.find($dropdownToggle).attr("aria-expanded", "true");
+          $this.find($dropdownMenu).addClass(showClass);
+        },
+        function() {
+          const $this = $(this);
+          $this.removeClass(showClass);
+          $this.find($dropdownToggle).attr("aria-expanded", "false");
+          $this.find($dropdownMenu).removeClass(showClass);
+        }
+      );
+    } else {
+      $dropdown.off("mouseenter mouseleave");
+    }
+  });
 });

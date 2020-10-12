@@ -17,7 +17,7 @@
 
 package org.apache.spark.scheduler
 
-import scala.collection.JavaConversions._
+import scala.collection.JavaConverters._
 import scala.collection.immutable.Set
 import scala.collection.mutable.{ArrayBuffer, HashMap, HashSet}
 
@@ -26,12 +26,15 @@ import org.apache.hadoop.mapred.{FileInputFormat, JobConf}
 import org.apache.hadoop.mapreduce.Job
 import org.apache.hadoop.util.ReflectionUtils
 
-import org.apache.spark.Logging
+import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.deploy.SparkHadoopUtil
+import org.apache.spark.internal.Logging
 
 /**
+ * :: DeveloperApi ::
  * Parses and holds information about inputFormat (and files) specified as a parameter.
  */
+@DeveloperApi
 class InputFormatInfo(val configuration: Configuration, val inputFormatClazz: Class[_],
     val path: String) extends Logging {
 
@@ -54,15 +57,14 @@ class InputFormatInfo(val configuration: Configuration, val inputFormatClazz: Cl
   // Since we are not doing canonicalization of path, this can be wrong : like relative vs
   // absolute path .. which is fine, this is best case effort to remove duplicates - right ?
   override def equals(other: Any): Boolean = other match {
-    case that: InputFormatInfo => {
+    case that: InputFormatInfo =>
       // not checking config - that should be fine, right ?
       this.inputFormatClazz == that.inputFormatClazz &&
         this.path == that.path
-    }
     case _ => false
   }
 
-  private def validate() {
+  private def validate(): Unit = {
     logDebug("validate InputFormatInfo : " + inputFormatClazz + ", path  " + path)
 
     try {
@@ -83,10 +85,9 @@ class InputFormatInfo(val configuration: Configuration, val inputFormatClazz: Cl
       }
     }
     catch {
-      case e: ClassNotFoundException => {
+      case e: ClassNotFoundException =>
         throw new IllegalArgumentException("Specified inputformat " + inputFormatClazz +
           " cannot be found ?", e)
-      }
     }
   }
 
@@ -100,11 +101,11 @@ class InputFormatInfo(val configuration: Configuration, val inputFormatClazz: Cl
     val instance: org.apache.hadoop.mapreduce.InputFormat[_, _] =
       ReflectionUtils.newInstance(inputFormatClazz.asInstanceOf[Class[_]], conf).asInstanceOf[
         org.apache.hadoop.mapreduce.InputFormat[_, _]]
-    val job = new Job(conf)
+    val job = Job.getInstance(conf)
 
     val retval = new ArrayBuffer[SplitInfo]()
     val list = instance.getSplits(job)
-    for (split <- list) {
+    for (split <- list.asScala) {
       retval ++= SplitInfo.toSplitInfo(inputFormatClazz, path, split)
     }
 
@@ -152,9 +153,9 @@ object InputFormatInfo {
 
     a) For each host, count number of splits hosted on that host.
     b) Decrement the currently allocated containers on that host.
-    c) Compute rack info for each host and update rack -> count map based on (b).
+    c) Compute rack info for each host and update rack to count map based on (b).
     d) Allocate nodes based on (c)
-    e) On the allocation result, ensure that we dont allocate "too many" jobs on a single node
+    e) On the allocation result, ensure that we don't allocate "too many" jobs on a single node
        (even if data locality on that is very high) : this is to prevent fragility of job if a
        single (or small set of) hosts go down.
 
@@ -164,20 +165,19 @@ object InputFormatInfo {
 
     PS: I know the wording here is weird, hopefully it makes some sense !
   */
-  def computePreferredLocations(formats: Seq[InputFormatInfo]): HashMap[String, HashSet[SplitInfo]]
-  = {
+  def computePreferredLocations(formats: Seq[InputFormatInfo]): Map[String, Set[SplitInfo]] = {
 
     val nodeToSplit = new HashMap[String, HashSet[SplitInfo]]
     for (inputSplit <- formats) {
       val splits = inputSplit.findPreferredLocations()
 
-      for (split <- splits){
+      for (split <- splits) {
         val location = split.hostLocation
         val set = nodeToSplit.getOrElseUpdate(location, new HashSet[SplitInfo])
         set += split
       }
     }
 
-    nodeToSplit
+    nodeToSplit.mapValues(_.toSet).toMap
   }
 }

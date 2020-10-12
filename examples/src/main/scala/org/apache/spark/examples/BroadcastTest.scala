@@ -15,47 +15,44 @@
  * limitations under the License.
  */
 
+// scalastyle:off println
 package org.apache.spark.examples
 
-import org.apache.spark.SparkContext
+import org.apache.spark.sql.SparkSession
 
+/**
+ * Usage: BroadcastTest [partitions] [numElem] [blockSize]
+ */
 object BroadcastTest {
-  def main(args: Array[String]) {
-    if (args.length == 0) {
-      System.err.println("Usage: BroadcastTest <master> [slices] [numElem] [broadcastAlgo]" +
-        " [blockSize]")
-      System.exit(1)
-    }
+  def main(args: Array[String]): Unit = {
 
-    val bcName = if (args.length > 3) args(3) else "Http"
-    val blockSize = if (args.length > 4) args(4) else "4096"
+    val blockSize = if (args.length > 2) args(2) else "4096"
 
-    System.setProperty("spark.broadcast.factory", "org.apache.spark.broadcast." + bcName +
-      "BroadcastFactory")
-    System.setProperty("spark.broadcast.blockSize", blockSize)
+    val spark = SparkSession
+      .builder()
+      .appName("Broadcast Test")
+      .config("spark.broadcast.blockSize", blockSize)
+      .getOrCreate()
 
-    val sc = new SparkContext(args(0), "Broadcast Test",
-      System.getenv("SPARK_HOME"), SparkContext.jarOfClass(this.getClass))
+    val sc = spark.sparkContext
 
-    val slices = if (args.length > 1) args(1).toInt else 2
-    val num = if (args.length > 2) args(2).toInt else 1000000
+    val slices = if (args.length > 0) args(0).toInt else 2
+    val num = if (args.length > 1) args(1).toInt else 1000000
 
-    val arr1 = new Array[Int](num)
-    for (i <- 0 until arr1.length) {
-      arr1(i) = i
-    }
+    val arr1 = (0 until num).toArray
 
     for (i <- 0 until 3) {
-      println("Iteration " + i)
+      println(s"Iteration $i")
       println("===========")
       val startTime = System.nanoTime
       val barr1 = sc.broadcast(arr1)
-      val observedSizes = sc.parallelize(1 to 10, slices).map(_ => barr1.value.size)
+      val observedSizes = sc.parallelize(1 to 10, slices).map(_ => barr1.value.length)
       // Collect the small RDD so we can print the observed sizes locally.
       observedSizes.collect().foreach(i => println(i))
       println("Iteration %d took %.0f milliseconds".format(i, (System.nanoTime - startTime) / 1E6))
     }
 
-    System.exit(0)
+    spark.stop()
   }
 }
+// scalastyle:on println

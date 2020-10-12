@@ -19,17 +19,20 @@ package org.apache.spark.api.java
 
 import java.lang.{Double => JDouble}
 
+import scala.language.implicitConversions
 import scala.reflect.ClassTag
 
 import org.apache.spark.Partitioner
-import org.apache.spark.SparkContext.doubleRDDToDoubleRDDFunctions
+import org.apache.spark.annotation.Since
 import org.apache.spark.api.java.function.{Function => JFunction}
 import org.apache.spark.partial.{BoundedDouble, PartialResult}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.util.StatCounter
+import org.apache.spark.util.Utils
 
-class JavaDoubleRDD(val srdd: RDD[scala.Double]) extends JavaRDDLike[JDouble, JavaDoubleRDD] {
+class JavaDoubleRDD(val srdd: RDD[scala.Double])
+  extends AbstractJavaRDDLike[JDouble, JavaDoubleRDD] {
 
   override val classTag: ClassTag[JDouble] = implicitly[ClassTag[JDouble]]
 
@@ -42,7 +45,9 @@ class JavaDoubleRDD(val srdd: RDD[scala.Double]) extends JavaRDDLike[JDouble, Ja
 
   import JavaDoubleRDD.fromRDD
 
-  /** Persist this RDD with the default storage level (`MEMORY_ONLY`). */
+  /**
+   * Persist this RDD with the default storage level (`MEMORY_ONLY`).
+   */
   def cache(): JavaDoubleRDD = fromRDD(srdd.cache())
 
   /**
@@ -64,7 +69,7 @@ class JavaDoubleRDD(val srdd: RDD[scala.Double]) extends JavaRDDLike[JDouble, Ja
    */
   def unpersist(blocking: Boolean): JavaDoubleRDD = fromRDD(srdd.unpersist(blocking))
 
-  // first() has to be overriden here in order for its return type to be Double instead of Object.
+  // first() has to be overridden here in order for its return type to be Double instead of Object.
   override def first(): JDouble = srdd.first()
 
   // Transformations (return a new RDD)
@@ -111,7 +116,7 @@ class JavaDoubleRDD(val srdd: RDD[scala.Double]) extends JavaRDDLike[JDouble, Ja
    * Return an RDD with the elements from `this` that are not in `other`.
    *
    * Uses `this` partitioner/partition size, because even if `other` is huge, the resulting
-   * RDD will be <= us.
+   * RDD will be &lt;= us.
    */
   def subtract(other: JavaDoubleRDD): JavaDoubleRDD =
     fromRDD(srdd.subtract(other))
@@ -131,7 +136,13 @@ class JavaDoubleRDD(val srdd: RDD[scala.Double]) extends JavaRDDLike[JDouble, Ja
   /**
    * Return a sampled subset of this RDD.
    */
-  def sample(withReplacement: Boolean, fraction: JDouble, seed: Int): JavaDoubleRDD =
+  def sample(withReplacement: Boolean, fraction: JDouble): JavaDoubleRDD =
+    sample(withReplacement, fraction, Utils.random.nextLong)
+
+  /**
+   * Return a sampled subset of this RDD.
+   */
+  def sample(withReplacement: Boolean, fraction: JDouble, seed: Long): JavaDoubleRDD =
     fromRDD(srdd.sample(withReplacement, fraction, seed))
 
   /**
@@ -144,7 +155,7 @@ class JavaDoubleRDD(val srdd: RDD[scala.Double]) extends JavaRDDLike[JDouble, Ja
    * Return the intersection of this RDD and another one. The output will not contain any duplicate
    * elements, even if the input RDDs did.
    *
-   * Note that this method performs a shuffle internally.
+   * @note This method performs a shuffle internally.
    */
   def intersection(other: JavaDoubleRDD): JavaDoubleRDD = fromRDD(srdd.intersection(other.srdd))
 
@@ -152,6 +163,20 @@ class JavaDoubleRDD(val srdd: RDD[scala.Double]) extends JavaRDDLike[JDouble, Ja
 
   /** Add up the elements in this RDD. */
   def sum(): JDouble = srdd.sum()
+
+  /**
+   * Returns the minimum element from this RDD as defined by
+   * the default comparator natural order.
+   * @return the minimum of the RDD
+   */
+  def min(): JDouble = min(com.google.common.collect.Ordering.natural())
+
+  /**
+   * Returns the maximum element from this RDD as defined by
+   * the default comparator natural order.
+   * @return the maximum of the RDD
+   */
+  def max(): JDouble = max(com.google.common.collect.Ordering.natural())
 
   /**
    * Return a [[org.apache.spark.util.StatCounter]] object that captures the mean, variance and
@@ -162,10 +187,10 @@ class JavaDoubleRDD(val srdd: RDD[scala.Double]) extends JavaRDDLike[JDouble, Ja
   /** Compute the mean of this RDD's elements. */
   def mean(): JDouble = srdd.mean()
 
-  /** Compute the variance of this RDD's elements. */
+  /** Compute the population variance of this RDD's elements. */
   def variance(): JDouble = srdd.variance()
 
-  /** Compute the standard deviation of this RDD's elements. */
+  /** Compute the population standard deviation of this RDD's elements. */
   def stdev(): JDouble = srdd.stdev()
 
   /**
@@ -180,18 +205,36 @@ class JavaDoubleRDD(val srdd: RDD[scala.Double]) extends JavaRDDLike[JDouble, Ja
    */
   def sampleVariance(): JDouble = srdd.sampleVariance()
 
+  /**
+   * Compute the population standard deviation of this RDD's elements.
+   */
+  @Since("2.1.0")
+  def popStdev(): JDouble = srdd.popStdev()
+
+  /**
+   * Compute the population variance of this RDD's elements.
+   */
+  @Since("2.1.0")
+  def popVariance(): JDouble = srdd.popVariance()
+
   /** Return the approximate mean of the elements in this RDD. */
   def meanApprox(timeout: Long, confidence: JDouble): PartialResult[BoundedDouble] =
     srdd.meanApprox(timeout, confidence)
 
-  /** (Experimental) Approximate operation to return the mean within a timeout. */
+  /**
+   * Approximate operation to return the mean within a timeout.
+   */
   def meanApprox(timeout: Long): PartialResult[BoundedDouble] = srdd.meanApprox(timeout)
 
-  /** (Experimental) Approximate operation to return the sum within a timeout. */
+  /**
+   * Approximate operation to return the sum within a timeout.
+   */
   def sumApprox(timeout: Long, confidence: JDouble): PartialResult[BoundedDouble] =
     srdd.sumApprox(timeout, confidence)
 
-  /** (Experimental) Approximate operation to return the sum within a timeout. */
+  /**
+   * Approximate operation to return the sum within a timeout.
+   */
   def sumApprox(timeout: Long): PartialResult[BoundedDouble] = srdd.sumApprox(timeout)
 
   /**
@@ -202,7 +245,7 @@ class JavaDoubleRDD(val srdd: RDD[scala.Double]) extends JavaRDDLike[JDouble, Ja
    * If the RDD contains infinity, NaN throws an exception
    * If the elements in RDD do not vary (max == min) always returns a single bucket.
    */
-  def histogram(bucketCount: Int): Pair[Array[scala.Double], Array[Long]] = {
+  def histogram(bucketCount: Int): (Array[scala.Double], Array[Long]) = {
     val result = srdd.histogram(bucketCount)
     (result._1, result._2)
   }
@@ -212,11 +255,11 @@ class JavaDoubleRDD(val srdd: RDD[scala.Double]) extends JavaRDDLike[JDouble, Ja
    * to the left except for the last which is closed
    *  e.g. for the array
    *  [1,10,20,50] the buckets are [1,10) [10,20) [20,50]
-   *  e.g 1<=x<10 , 10<=x<20, 20<=x<50
+   *  e.g 1&lt;=x&lt;10 , 10&lt;=x&lt;20, 20&lt;=x&lt;50
    *  And on the input of 1 and 50 we would have a histogram of 1,0,0
    *
-   * Note: if your histogram is evenly spaced (e.g. [0, 10, 20, 30]) this can be switched
-   * from an O(log n) inseration to O(1) per element. (where n = # buckets) if you set evenBuckets
+   * @note If your histogram is evenly spaced (e.g. [0, 10, 20, 30]) this can be switched
+   * from an O(log n) insertion to O(1) per element. (where n = # buckets) if you set evenBuckets
    * to true.
    * buckets must be sorted and not contain any duplicates.
    * buckets array must be at least two elements

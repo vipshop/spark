@@ -19,12 +19,13 @@ package org.apache.spark.util.collection
 
 import scala.collection.mutable.HashSet
 
-import org.scalatest.FunSuite
-import org.scalatest.matchers.ShouldMatchers
+import org.scalatest.matchers.must.Matchers
+import org.scalatest.matchers.should.Matchers._
 
+import org.apache.spark.SparkFunSuite
 import org.apache.spark.util.SizeEstimator
 
-class OpenHashMapSuite extends FunSuite with ShouldMatchers {
+class OpenHashMapSuite extends SparkFunSuite with Matchers {
 
   test("size for specialized, primitive value (int)") {
     val capacity = 1024
@@ -44,13 +45,10 @@ class OpenHashMapSuite extends FunSuite with ShouldMatchers {
     val goodMap3 = new OpenHashMap[String, String](256)
     assert(goodMap3.size === 0)
     intercept[IllegalArgumentException] {
-      new OpenHashMap[String, Int](1 << 30) // Invalid map size: bigger than 2^29
+      new OpenHashMap[String, Int](1 << 30 + 1) // Invalid map size: bigger than 2^30
     }
     intercept[IllegalArgumentException] {
       new OpenHashMap[String, Int](-1)
-    }
-    intercept[IllegalArgumentException] {
-      new OpenHashMap[String, String](0)
     }
   }
 
@@ -78,7 +76,7 @@ class OpenHashMapSuite extends FunSuite with ShouldMatchers {
     for ((k, v) <- map) {
       set.add((k, v))
     }
-    val expected = (1 to 1000).map(x => (x.toString, x)) :+ (null.asInstanceOf[String], -1)
+    val expected = (1 to 1000).map(x => (x.toString, x)) :+ ((null.asInstanceOf[String], -1))
     assert(set === expected.toSet)
   }
 
@@ -106,7 +104,8 @@ class OpenHashMapSuite extends FunSuite with ShouldMatchers {
     for ((k, v) <- map) {
       set.add((k, v))
     }
-    val expected = (1 to 1000).map(_.toString).map(x => (x, x)) :+ (null.asInstanceOf[String], "-1")
+    val expected =
+      (1 to 1000).map(_.toString).map(x => (x, x)) :+ ((null.asInstanceOf[String], "-1"))
     assert(set === expected.toSet)
   }
 
@@ -175,5 +174,61 @@ class OpenHashMapSuite extends FunSuite with ShouldMatchers {
     for (i <- 1 to 100) {
       assert(map(i.toString) === i.toString)
     }
+  }
+
+  test("contains") {
+    val map = new OpenHashMap[String, Int](2)
+    map("a") = 1
+    assert(map.contains("a"))
+    assert(!map.contains("b"))
+    assert(!map.contains(null))
+    map(null) = 0
+    assert(map.contains(null))
+  }
+
+  test("distinguish between the 0/0.0/0L and null") {
+    val specializedMap1 = new OpenHashMap[String, Long]
+    specializedMap1("a") = null.asInstanceOf[Long]
+    specializedMap1("b") = 0L
+    assert(specializedMap1.contains("a"))
+    assert(!specializedMap1.contains("c"))
+    // null.asInstance[Long] will return 0L
+    assert(specializedMap1("a") === 0L)
+    assert(specializedMap1("b") === 0L)
+    // If the data type is in @specialized annotation, and
+    // the `key` is not be contained, the `map(key)` will return 0
+    assert(specializedMap1("c") === 0L)
+
+    val specializedMap2 = new OpenHashMap[String, Double]
+    specializedMap2("a") = null.asInstanceOf[Double]
+    specializedMap2("b") = 0.toDouble
+    assert(specializedMap2.contains("a"))
+    assert(!specializedMap2.contains("c"))
+    // null.asInstance[Double] will return 0.0
+    assert(specializedMap2("a") === 0.0)
+    assert(specializedMap2("b") === 0.0)
+    assert(specializedMap2("c") === 0.0)
+
+    val map1 = new OpenHashMap[String, Short]
+    map1("a") = null.asInstanceOf[Short]
+    map1("b") = 0.toShort
+    assert(map1.contains("a"))
+    assert(!map1.contains("c"))
+    // null.asInstance[Short] will return 0
+    assert(map1("a") === 0)
+    assert(map1("b") === 0)
+    // If the data type is not in @specialized annotation, and
+    // the `key` is not be contained, the `map(key)` will return null
+    assert(map1("c") === null)
+
+    val map2 = new OpenHashMap[String, Float]
+    map2("a") = null.asInstanceOf[Float]
+    map2("b") = 0.toFloat
+    assert(map2.contains("a"))
+    assert(!map2.contains("c"))
+    // null.asInstance[Float] will return 0.0
+    assert(map2("a") === 0.0)
+    assert(map2("b") === 0.0)
+    assert(map2("c") === null)
   }
 }

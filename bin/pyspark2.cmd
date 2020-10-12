@@ -17,39 +17,22 @@ rem See the License for the specific language governing permissions and
 rem limitations under the License.
 rem
 
-set SCALA_VERSION=2.10
-
 rem Figure out where the Spark framework is installed
-set FWDIR=%~dp0..\
+call "%~dp0find-spark-home.cmd"
 
-rem Export this as SPARK_HOME
-set SPARK_HOME=%FWDIR%
-
-rem Test whether the user has built Spark
-if exist "%FWDIR%RELEASE" goto skip_build_test
-set FOUND_JAR=0
-for %%d in ("%FWDIR%assembly\target\scala-%SCALA_VERSION%\spark-assembly*hadoop*.jar") do (
-  set FOUND_JAR=1
-)
-if "%FOUND_JAR%"=="0" (
-  echo Failed to find Spark assembly JAR.
-  echo You need to build Spark with sbt\sbt assembly before running this program.
-  goto exit
-)
-:skip_build_test
-
-rem Load environment variables from conf\spark-env.cmd, if it exists
-if exist "%FWDIR%conf\spark-env.cmd" call "%FWDIR%conf\spark-env.cmd"
+call "%SPARK_HOME%\bin\load-spark-env.cmd"
+set _SPARK_CMD_USAGE=Usage: bin\pyspark.cmd [options]
 
 rem Figure out which Python to use.
-if "x%PYSPARK_PYTHON%"=="x" set PYSPARK_PYTHON=python
+if "x%PYSPARK_DRIVER_PYTHON%"=="x" (
+  set PYSPARK_DRIVER_PYTHON=python
+  if not [%PYSPARK_PYTHON%] == [] set PYSPARK_DRIVER_PYTHON=%PYSPARK_PYTHON%
+)
 
-set PYTHONPATH=%FWDIR%python;%PYTHONPATH%
+set PYTHONPATH=%SPARK_HOME%\python;%PYTHONPATH%
+set PYTHONPATH=%SPARK_HOME%\python\lib\py4j-0.10.9-src.zip;%PYTHONPATH%
 
 set OLD_PYTHONSTARTUP=%PYTHONSTARTUP%
-set PYTHONSTARTUP=%FWDIR%python\pyspark\shell.py
+set PYTHONSTARTUP=%SPARK_HOME%\python\pyspark\shell.py
 
-echo Running %PYSPARK_PYTHON% with PYTHONPATH=%PYTHONPATH%
-
-"%PYSPARK_PYTHON%" %*
-:exit
+call "%SPARK_HOME%\bin\spark-submit2.cmd" pyspark-shell-main --name "PySparkShell" %*

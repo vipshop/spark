@@ -17,105 +17,165 @@
 
 package org.apache.spark.ui
 
-import org.eclipse.jetty.servlet.ServletContextHandler
+import java.util.Date
 
-import org.apache.spark.{Logging, SecurityManager, SparkConf, SparkContext, SparkEnv}
+import org.apache.spark.{SecurityManager, SparkConf, SparkContext}
+import org.apache.spark.internal.Logging
+import org.apache.spark.internal.config.UI._
 import org.apache.spark.scheduler._
-import org.apache.spark.storage.StorageStatusListener
+import org.apache.spark.status.AppStatusStore
+import org.apache.spark.status.api.v1._
 import org.apache.spark.ui.JettyUtils._
-import org.apache.spark.ui.env.EnvironmentUI
-import org.apache.spark.ui.exec.ExecutorsUI
-import org.apache.spark.ui.jobs.JobProgressUI
-import org.apache.spark.ui.storage.BlockManagerUI
-import org.apache.spark.util.Utils
+import org.apache.spark.ui.env.EnvironmentTab
+import org.apache.spark.ui.exec.ExecutorsTab
+import org.apache.spark.ui.jobs.{JobsTab, StagesTab}
+import org.apache.spark.ui.storage.StorageTab
 
-/** Top level user interface for Spark */
-private[spark] class SparkUI(
-    val sc: SparkContext,
-    conf: SparkConf,
-    val listenerBus: SparkListenerBus,
-    val appName: String,
-    val basePath: String = "")
-  extends Logging {
+/**
+ * Top level user interface for a Spark application.
+ */
+private[spark] class SparkUI private (
+    val store: AppStatusStore,
+    val sc: Option[SparkContext],
+    val conf: SparkConf,
+    securityManager: SecurityManager,
+    var appName: String,
+    val basePath: String,
+    val startTime: Long,
+    val appSparkVersion: String)
+  extends WebUI(securityManager, securityManager.getSSLOptions("ui"), SparkUI.getUIPort(conf),
+    conf, basePath, "SparkUI")
+  with Logging
+  with UIRoot {
 
-  def this(sc: SparkContext) = this(sc, sc.conf, sc.listenerBus, sc.appName)
-  def this(conf: SparkConf, listenerBus: SparkListenerBus, appName: String, basePath: String) =
-    this(null, conf, listenerBus, appName, basePath)
+  val killEnabled = sc.map(_.conf.get(UI_KILL_ENABLED)).getOrElse(false)
 
-  // If SparkContext is not provided, assume the associated application is not live
-  val live = sc != null
+  var appId: String = _
 
-  val securityManager = if (live) sc.env.securityManager else new SecurityManager(conf)
+  private var streamingJobProgressListener: Option[SparkListener] = None
 
-  private val host = Option(System.getenv("SPARK_PUBLIC_DNS")).getOrElse(Utils.localHostName())
-  private val port = conf.get("spark.ui.port", SparkUI.DEFAULT_PORT).toInt
-  private var serverInfo: Option[ServerInfo] = None
-
-  private val storage = new BlockManagerUI(this)
-  private val jobs = new JobProgressUI(this)
-  private val env = new EnvironmentUI(this)
-  private val exec = new ExecutorsUI(this)
-
-  val handlers: Seq[ServletContextHandler] = {
-    val metricsServletHandlers = if (live) {
-      SparkEnv.get.metricsSystem.getServletHandlers
-    } else {
-      Array[ServletContextHandler]()
+  /** Initialize all components of the server. */
+  def initialize(): Unit = {
+    val jobsTab = new JobsTab(this, store)
+    attachTab(jobsTab)
+    val stagesTab = new StagesTab(this, store)
+    attachTab(stagesTab)
+    attachTab(new StorageTab(this, store))
+    attachTab(new EnvironmentTab(this, store))
+    attachTab(new ExecutorsTab(this))
+    addStaticHandler(SparkUI.STATIC_RESOURCE_DIR)
+    attachHandler(createRedirectHandler("/", "/jobs/", basePath = basePath))
+    attachHandler(ApiRootResource.getServletHandler(this))
+    if (sc.map(_.conf.get(UI_PROMETHEUS_ENABLED)).getOrElse(false)) {
+      attachHandler(PrometheusResource.getServletHandler(this))
     }
-    storage.getHandlers ++
-    jobs.getHandlers ++
-    env.getHandlers ++
-    exec.getHandlers ++
-    metricsServletHandlers ++
-    Seq[ServletContextHandler] (
-      createStaticHandler(SparkUI.STATIC_RESOURCE_DIR, "/static"),
-      createRedirectHandler("/", "/stages", basePath)
-    )
+
+    // These should be POST only, but, the YARN AM proxy won't proxy POSTs
+    attachHandler(createRedirectHandler(
+      "/jobs/job/kill", "/jobs/", jobsTab.handleKillRequest, httpMethods = Set("GET", "POST")))
+    attachHandler(createRedirectHandler(
+      "/stages/stage/kill", "/stages/", stagesTab.handleKillRequest,
+      httpMethods = Set("GET", "POST")))
   }
 
-  // Maintain executor storage status through Spark events
-  val storageStatusListener = new StorageStatusListener
+  initialize()
 
-  /** Bind the HTTP server which backs this web interface */
-  def bind() {
+  def getSparkUser: String = {
     try {
-      serverInfo = Some(startJettyServer(host, port, handlers, sc.conf))
-      logInfo("Started Spark Web UI at http://%s:%d".format(host, boundPort))
+      Option(store.applicationInfo().attempts.head.sparkUser)
+        .orElse(store.environmentInfo().systemProperties.toMap.get("user.name"))
+        .getOrElse("<unknown>")
     } catch {
-      case e: Exception =>
-        logError("Failed to create Spark JettyUtils", e)
-        System.exit(1)
+      case _: NoSuchElementException => "<unknown>"
     }
   }
 
-  def boundPort: Int = serverInfo.map(_.boundPort).getOrElse(-1)
+  def getAppName: String = appName
 
-  /** Initialize all components of the server */
-  def start() {
-    storage.start()
-    jobs.start()
-    env.start()
-    exec.start()
-
-    // Storage status listener must receive events first, as other listeners depend on its state
-    listenerBus.addListener(storageStatusListener)
-    listenerBus.addListener(storage.listener)
-    listenerBus.addListener(jobs.listener)
-    listenerBus.addListener(env.listener)
-    listenerBus.addListener(exec.listener)
+  def setAppId(id: String): Unit = {
+    appId = id
   }
 
-  def stop() {
-    assert(serverInfo.isDefined, "Attempted to stop a SparkUI that was not bound to a server!")
-    serverInfo.get.server.stop()
-    logInfo("Stopped Spark Web UI at %s".format(appUIAddress))
+  /** Stop the server behind this web interface. Only valid after bind(). */
+  override def stop(): Unit = {
+    super.stop()
+    logInfo(s"Stopped Spark web UI at $webUrl")
   }
 
-  private[spark] def appUIAddress = "http://" + host + ":" + boundPort
+  override def withSparkUI[T](appId: String, attemptId: Option[String])(fn: SparkUI => T): T = {
+    if (appId == this.appId) {
+      fn(this)
+    } else {
+      throw new NoSuchElementException()
+    }
+  }
 
+  def getApplicationInfoList: Iterator[ApplicationInfo] = {
+    Iterator(new ApplicationInfo(
+      id = appId,
+      name = appName,
+      coresGranted = None,
+      maxCores = None,
+      coresPerExecutor = None,
+      memoryPerExecutorMB = None,
+      attempts = Seq(new ApplicationAttemptInfo(
+        attemptId = None,
+        startTime = new Date(startTime),
+        endTime = new Date(-1),
+        duration = 0,
+        lastUpdated = new Date(startTime),
+        sparkUser = getSparkUser,
+        completed = false,
+        appSparkVersion = appSparkVersion
+      ))
+    ))
+  }
+
+  def getApplicationInfo(appId: String): Option[ApplicationInfo] = {
+    getApplicationInfoList.find(_.id == appId)
+  }
+
+  def getStreamingJobProgressListener: Option[SparkListener] = streamingJobProgressListener
+
+  def setStreamingJobProgressListener(sparkListener: SparkListener): Unit = {
+    streamingJobProgressListener = Option(sparkListener)
+  }
+
+  def clearStreamingJobProgressListener(): Unit = {
+    streamingJobProgressListener = None
+  }
+}
+
+private[spark] abstract class SparkUITab(parent: SparkUI, prefix: String)
+  extends WebUITab(parent, prefix) {
+
+  def appName: String = parent.appName
+
+  def appSparkVersion: String = parent.appSparkVersion
 }
 
 private[spark] object SparkUI {
-  val DEFAULT_PORT = "4040"
   val STATIC_RESOURCE_DIR = "org/apache/spark/ui/static"
+  val DEFAULT_POOL_NAME = "default"
+
+  def getUIPort(conf: SparkConf): Int = {
+    conf.get(UI_PORT)
+  }
+
+  /**
+   * Create a new UI backed by an AppStatusStore.
+   */
+  def create(
+      sc: Option[SparkContext],
+      store: AppStatusStore,
+      conf: SparkConf,
+      securityManager: SecurityManager,
+      appName: String,
+      basePath: String,
+      startTime: Long,
+      appSparkVersion: String = org.apache.spark.SPARK_VERSION): SparkUI = {
+
+    new SparkUI(store, sc, conf, securityManager, appName, basePath, startTime, appSparkVersion)
+  }
+
 }

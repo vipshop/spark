@@ -18,9 +18,12 @@
 package org.apache.spark.broadcast
 
 import java.io.Serializable
-import java.util.concurrent.atomic.AtomicLong
 
-import org.apache.spark._
+import scala.reflect.ClassTag
+
+import org.apache.spark.SparkException
+import org.apache.spark.internal.Logging
+import org.apache.spark.util.Utils
 
 /**
  * A broadcast variable. Broadcast variables allow the programmer to keep a read-only variable
@@ -29,13 +32,14 @@ import org.apache.spark._
  * attempts to distribute broadcast variables using efficient broadcast algorithms to reduce
  * communication cost.
  *
- * Broadcast variables are created from a variable `v` by calling [[SparkContext#broadcast]].
+ * Broadcast variables are created from a variable `v` by calling
+ * [[org.apache.spark.SparkContext#broadcast]].
  * The broadcast variable is a wrapper around `v`, and its value can be accessed by calling the
  * `value` method. The interpreter session below shows this:
  *
  * {{{
  * scala> val broadcastVar = sc.broadcast(Array(1, 2, 3))
- * broadcastVar: spark.Broadcast[Array[Int]] = spark.Broadcast(b5c40191-a864-4c7d-b9bf-d87e1a4e787c)
+ * broadcastVar: org.apache.spark.broadcast.Broadcast[Array[Int]] = Broadcast(0)
  *
  * scala> broadcastVar.value
  * res0: Array[Int] = Array(1, 2, 3)
@@ -50,50 +54,96 @@ import org.apache.spark._
  * @param id A unique identifier for the broadcast variable.
  * @tparam T Type of the data contained in the broadcast variable.
  */
-abstract class Broadcast[T](val id: Long) extends Serializable {
-  def value: T
+abstract class Broadcast[T: ClassTag](val id: Long) extends Serializable with Logging {
 
-  // We cannot have an abstract readObject here due to some weird issues with
-  // readObject having to be 'private' in sub-classes.
+  /**
+   * Flag signifying whether the broadcast variable is valid
+   * (that is, not already destroyed) or not.
+   */
+  @volatile private var _isValid = true
 
-  override def toString = "Broadcast(" + id + ")"
-}
+  private var _destroySite = ""
 
-private[spark]
-class BroadcastManager(val _isDriver: Boolean, conf: SparkConf, securityManager: SecurityManager)
-    extends Logging with Serializable {
+  /** Get the broadcasted value. */
+  def value: T = {
+    assertValid()
+    getValue()
+  }
 
-  private var initialized = false
-  private var broadcastFactory: BroadcastFactory = null
+  /**
+   * Asynchronously delete cached copies of this broadcast on the executors.
+   * If the broadcast is used after this is called, it will need to be re-sent to each executor.
+   */
+  def unpersist(): Unit = {
+    unpersist(blocking = false)
+  }
 
-  initialize()
+  /**
+   * Delete cached copies of this broadcast on the executors. If the broadcast is used after
+   * this is called, it will need to be re-sent to each executor.
+   * @param blocking Whether to block until unpersisting has completed
+   */
+  def unpersist(blocking: Boolean): Unit = {
+    assertValid()
+    doUnpersist(blocking)
+  }
 
-  // Called by SparkContext or Executor before using Broadcast
-  private def initialize() {
-    synchronized {
-      if (!initialized) {
-        val broadcastFactoryClass = conf.get(
-          "spark.broadcast.factory", "org.apache.spark.broadcast.HttpBroadcastFactory")
 
-        broadcastFactory =
-          Class.forName(broadcastFactoryClass).newInstance.asInstanceOf[BroadcastFactory]
+  /**
+   * Destroy all data and metadata related to this broadcast variable. Use this with caution;
+   * once a broadcast variable has been destroyed, it cannot be used again.
+   */
+  def destroy(): Unit = {
+    destroy(blocking = false)
+  }
 
-        // Initialize appropriate BroadcastFactory and BroadcastObject
-        broadcastFactory.initialize(isDriver, conf, securityManager)
+  /**
+   * Destroy all data and metadata related to this broadcast variable. Use this with caution;
+   * once a broadcast variable has been destroyed, it cannot be used again.
+   * @param blocking Whether to block until destroy has completed
+   */
+  private[spark] def destroy(blocking: Boolean): Unit = {
+    assertValid()
+    _isValid = false
+    _destroySite = Utils.getCallSite().shortForm
+    logInfo("Destroying %s (from %s)".format(toString, _destroySite))
+    doDestroy(blocking)
+  }
 
-        initialized = true
-      }
+  /**
+   * Whether this Broadcast is actually usable. This should be false once persisted state is
+   * removed from the driver.
+   */
+  private[spark] def isValid: Boolean = {
+    _isValid
+  }
+
+  /**
+   * Actually get the broadcasted value. Concrete implementations of Broadcast class must
+   * define their own way to get the value.
+   */
+  protected def getValue(): T
+
+  /**
+   * Actually unpersist the broadcasted value on the executors. Concrete implementations of
+   * Broadcast class must define their own logic to unpersist their own data.
+   */
+  protected def doUnpersist(blocking: Boolean): Unit
+
+  /**
+   * Actually destroy all data and metadata related to this broadcast variable.
+   * Implementation of Broadcast class must define their own logic to destroy their own
+   * state.
+   */
+  protected def doDestroy(blocking: Boolean): Unit
+
+  /** Check if this broadcast is valid. If not valid, exception is thrown. */
+  protected def assertValid(): Unit = {
+    if (!_isValid) {
+      throw new SparkException(
+        "Attempted to use %s after it was destroyed (%s) ".format(toString, _destroySite))
     }
   }
 
-  def stop() {
-    broadcastFactory.stop()
-  }
-
-  private val nextBroadcastId = new AtomicLong(0)
-
-  def newBroadcast[T](value_ : T, isLocal: Boolean) =
-    broadcastFactory.newBroadcast[T](value_, isLocal, nextBroadcastId.getAndIncrement())
-
-  def isDriver = _isDriver
+  override def toString: String = "Broadcast(" + id + ")"
 }

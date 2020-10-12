@@ -19,93 +19,140 @@ package org.apache.spark.storage
 
 import java.util.UUID
 
+import org.apache.spark.SparkException
+import org.apache.spark.annotation.DeveloperApi
+
 /**
+ * :: DeveloperApi ::
  * Identifies a particular Block of data, usually associated with a single file.
  * A Block can be uniquely identified by its filename, but each type of Block has a different
  * set of keys which produce its unique name.
  *
  * If your BlockId should be serializable, be sure to add it to the BlockId.apply() method.
  */
-private[spark] sealed abstract class BlockId {
+@DeveloperApi
+sealed abstract class BlockId {
   /** A globally unique identifier for this Block. Can be used for ser/de. */
   def name: String
 
   // convenience methods
-  def asRDDId = if (isRDD) Some(asInstanceOf[RDDBlockId]) else None
-  def isRDD = isInstanceOf[RDDBlockId]
-  def isShuffle = isInstanceOf[ShuffleBlockId]
-  def isBroadcast = isInstanceOf[BroadcastBlockId] || isInstanceOf[BroadcastHelperBlockId]
+  def asRDDId: Option[RDDBlockId] = if (isRDD) Some(asInstanceOf[RDDBlockId]) else None
+  def isRDD: Boolean = isInstanceOf[RDDBlockId]
+  def isShuffle: Boolean = {
+    (isInstanceOf[ShuffleBlockId] || isInstanceOf[ShuffleBlockBatchId] ||
+     isInstanceOf[ShuffleDataBlockId] || isInstanceOf[ShuffleIndexBlockId])
+  }
+  def isBroadcast: Boolean = isInstanceOf[BroadcastBlockId]
 
-  override def toString = name
-  override def hashCode = name.hashCode
-  override def equals(other: Any): Boolean = other match {
-    case o: BlockId => getClass == o.getClass && name.equals(o.name)
-    case _ => false
+  override def toString: String = name
+}
+
+@DeveloperApi
+case class RDDBlockId(rddId: Int, splitIndex: Int) extends BlockId {
+  override def name: String = "rdd_" + rddId + "_" + splitIndex
+}
+
+// Format of the shuffle block ids (including data and index) should be kept in sync with
+// org.apache.spark.network.shuffle.ExternalShuffleBlockResolver#getBlockData().
+@DeveloperApi
+case class ShuffleBlockId(shuffleId: Int, mapId: Long, reduceId: Int) extends BlockId {
+  override def name: String = "shuffle_" + shuffleId + "_" + mapId + "_" + reduceId
+}
+
+// The batch id of continuous shuffle blocks of same mapId in range [startReduceId, endReduceId).
+@DeveloperApi
+case class ShuffleBlockBatchId(
+    shuffleId: Int,
+    mapId: Long,
+    startReduceId: Int,
+    endReduceId: Int) extends BlockId {
+  override def name: String = {
+    "shuffle_" + shuffleId + "_" + mapId + "_" + startReduceId + "_" + endReduceId
   }
 }
 
-private[spark] case class RDDBlockId(rddId: Int, splitIndex: Int) extends BlockId {
-  def name = "rdd_" + rddId + "_" + splitIndex
+@DeveloperApi
+case class ShuffleDataBlockId(shuffleId: Int, mapId: Long, reduceId: Int) extends BlockId {
+  override def name: String = "shuffle_" + shuffleId + "_" + mapId + "_" + reduceId + ".data"
 }
 
-private[spark]
-case class ShuffleBlockId(shuffleId: Int, mapId: Int, reduceId: Int) extends BlockId {
-  def name = "shuffle_" + shuffleId + "_" + mapId + "_" + reduceId
+@DeveloperApi
+case class ShuffleIndexBlockId(shuffleId: Int, mapId: Long, reduceId: Int) extends BlockId {
+  override def name: String = "shuffle_" + shuffleId + "_" + mapId + "_" + reduceId + ".index"
 }
 
-private[spark] case class BroadcastBlockId(broadcastId: Long) extends BlockId {
-  def name = "broadcast_" + broadcastId
+@DeveloperApi
+case class BroadcastBlockId(broadcastId: Long, field: String = "") extends BlockId {
+  override def name: String = "broadcast_" + broadcastId + (if (field == "") "" else "_" + field)
 }
 
-private[spark]
-case class BroadcastHelperBlockId(broadcastId: BroadcastBlockId, hType: String) extends BlockId {
-  def name = broadcastId.name + "_" + hType
+@DeveloperApi
+case class TaskResultBlockId(taskId: Long) extends BlockId {
+  override def name: String = "taskresult_" + taskId
 }
 
-private[spark] case class TaskResultBlockId(taskId: Long) extends BlockId {
-  def name = "taskresult_" + taskId
+@DeveloperApi
+case class StreamBlockId(streamId: Int, uniqueId: Long) extends BlockId {
+  override def name: String = "input-" + streamId + "-" + uniqueId
 }
 
-private[spark] case class StreamBlockId(streamId: Int, uniqueId: Long) extends BlockId {
-  def name = "input-" + streamId + "-" + uniqueId
+/** Id associated with temporary local data managed as blocks. Not serializable. */
+private[spark] case class TempLocalBlockId(id: UUID) extends BlockId {
+  override def name: String = "temp_local_" + id
 }
 
-/** Id associated with temporary data managed as blocks. Not serializable. */
-private[spark] case class TempBlockId(id: UUID) extends BlockId {
-  def name = "temp_" + id
+/** Id associated with temporary shuffle data managed as blocks. Not serializable. */
+private[spark] case class TempShuffleBlockId(id: UUID) extends BlockId {
+  override def name: String = "temp_shuffle_" + id
 }
 
 // Intended only for testing purposes
 private[spark] case class TestBlockId(id: String) extends BlockId {
-  def name = "test_" + id
+  override def name: String = "test_" + id
 }
 
-private[spark] object BlockId {
+@DeveloperApi
+class UnrecognizedBlockId(name: String)
+    extends SparkException(s"Failed to parse $name into a block ID")
+
+@DeveloperApi
+object BlockId {
   val RDD = "rdd_([0-9]+)_([0-9]+)".r
   val SHUFFLE = "shuffle_([0-9]+)_([0-9]+)_([0-9]+)".r
-  val BROADCAST = "broadcast_([0-9]+)".r
-  val BROADCAST_HELPER = "broadcast_([0-9]+)_([A-Za-z0-9]+)".r
+  val SHUFFLE_BATCH = "shuffle_([0-9]+)_([0-9]+)_([0-9]+)_([0-9]+)".r
+  val SHUFFLE_DATA = "shuffle_([0-9]+)_([0-9]+)_([0-9]+).data".r
+  val SHUFFLE_INDEX = "shuffle_([0-9]+)_([0-9]+)_([0-9]+).index".r
+  val BROADCAST = "broadcast_([0-9]+)([_A-Za-z0-9]*)".r
   val TASKRESULT = "taskresult_([0-9]+)".r
   val STREAM = "input-([0-9]+)-([0-9]+)".r
+  val TEMP_LOCAL = "temp_local_([-A-Fa-f0-9]+)".r
+  val TEMP_SHUFFLE = "temp_shuffle_([-A-Fa-f0-9]+)".r
   val TEST = "test_(.*)".r
 
-  /** Converts a BlockId "name" String back into a BlockId. */
-  def apply(id: String) = id match {
+  def apply(name: String): BlockId = name match {
     case RDD(rddId, splitIndex) =>
       RDDBlockId(rddId.toInt, splitIndex.toInt)
     case SHUFFLE(shuffleId, mapId, reduceId) =>
-      ShuffleBlockId(shuffleId.toInt, mapId.toInt, reduceId.toInt)
-    case BROADCAST(broadcastId) =>
-      BroadcastBlockId(broadcastId.toLong)
-    case BROADCAST_HELPER(broadcastId, hType) =>
-      BroadcastHelperBlockId(BroadcastBlockId(broadcastId.toLong), hType)
+      ShuffleBlockId(shuffleId.toInt, mapId.toLong, reduceId.toInt)
+    case SHUFFLE_BATCH(shuffleId, mapId, startReduceId, endReduceId) =>
+      ShuffleBlockBatchId(shuffleId.toInt, mapId.toLong, startReduceId.toInt, endReduceId.toInt)
+    case SHUFFLE_DATA(shuffleId, mapId, reduceId) =>
+      ShuffleDataBlockId(shuffleId.toInt, mapId.toLong, reduceId.toInt)
+    case SHUFFLE_INDEX(shuffleId, mapId, reduceId) =>
+      ShuffleIndexBlockId(shuffleId.toInt, mapId.toLong, reduceId.toInt)
+    case BROADCAST(broadcastId, field) =>
+      BroadcastBlockId(broadcastId.toLong, field.stripPrefix("_"))
     case TASKRESULT(taskId) =>
       TaskResultBlockId(taskId.toLong)
     case STREAM(streamId, uniqueId) =>
       StreamBlockId(streamId.toInt, uniqueId.toLong)
+    case TEMP_LOCAL(uuid) =>
+      TempLocalBlockId(UUID.fromString(uuid))
+    case TEMP_SHUFFLE(uuid) =>
+      TempShuffleBlockId(UUID.fromString(uuid))
     case TEST(value) =>
       TestBlockId(value)
     case _ =>
-      throw new IllegalStateException("Unrecognized BlockId: " + id)
+      throw new UnrecognizedBlockId(name)
   }
 }

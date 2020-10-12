@@ -20,6 +20,7 @@ package org.apache.spark.mllib.util
 import scala.util.Random
 
 import org.apache.spark.SparkContext
+import org.apache.spark.annotation.Since
 import org.apache.spark.rdd.RDD
 
 /**
@@ -27,7 +28,7 @@ import org.apache.spark.rdd.RDD
  * from a d-dimensional Gaussian distribution scaled by factor r and then creates a Gaussian
  * cluster with scale 1 around each center.
  */
-
+@Since("0.8.0")
 object KMeansDataGenerator {
 
   /**
@@ -40,6 +41,7 @@ object KMeansDataGenerator {
    * @param r Scaling factor for the distribution of the initial centers
    * @param numPartitions Number of partitions of the generated RDD; default 2
    */
+  @Since("0.8.0")
   def generateKMeansRDD(
       sc: SparkContext,
       numPoints: Int,
@@ -60,10 +62,13 @@ object KMeansDataGenerator {
     }
   }
 
-  def main(args: Array[String]) {
+  @Since("0.8.0")
+  def main(args: Array[String]): Unit = {
     if (args.length < 6) {
+      // scalastyle:off println
       println("Usage: KMeansGenerator " +
         "<master> <output_dir> <num_points> <k> <d> <r> [<num_partitions>]")
+      // scalastyle:on println
       System.exit(1)
     }
 
@@ -79,6 +84,7 @@ object KMeansDataGenerator {
     val data = generateKMeansRDD(sc, numPoints, k, d, r, parts)
     data.map(_.mkString(" ")).saveAsTextFile(outputPath)
 
+    sc.stop()
     System.exit(0)
   }
 }

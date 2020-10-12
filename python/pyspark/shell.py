@@ -20,35 +20,54 @@ An interactive shell.
 
 This file is designed to be launched as a PYTHONSTARTUP script.
 """
+
+import atexit
 import os
 import platform
-import pyspark
+import warnings
+
 from pyspark.context import SparkContext
-from pyspark.storagelevel import StorageLevel
+from pyspark.sql import SparkSession
 
-# this is the equivalent of ADD_JARS
-add_files = os.environ.get("ADD_FILES").split(',') if os.environ.get("ADD_FILES") != None else None
+if os.environ.get("SPARK_EXECUTOR_URI"):
+    SparkContext.setSystemProperty("spark.executor.uri", os.environ["SPARK_EXECUTOR_URI"])
 
-sc = SparkContext(os.environ.get("MASTER", "local"), "PySparkShell", pyFiles=add_files)
+SparkContext._ensure_initialized()  # type: ignore
 
-print """Welcome to
+try:
+    spark = SparkSession._create_shell_session()  # type: ignore
+except Exception:
+    import sys
+    import traceback
+    warnings.warn("Failed to initialize Spark session.")
+    traceback.print_exc(file=sys.stderr)
+    sys.exit(1)
+
+sc = spark.sparkContext
+sql = spark.sql
+atexit.register(lambda: sc.stop())
+
+# for compatibility
+sqlContext = spark._wrapped
+sqlCtx = sqlContext
+
+print(r"""Welcome to
       ____              __
      / __/__  ___ _____/ /__
     _\ \/ _ \/ _ `/ __/  '_/
-   /__ / .__/\_,_/_/ /_/\_\   version 1.0.0-SNAPSHOT
+   /__ / .__/\_,_/_/ /_/\_\   version %s
       /_/
-"""
-print "Using Python version %s (%s, %s)" % (
+""" % sc.version)
+print("Using Python version %s (%s, %s)" % (
     platform.python_version(),
     platform.python_build()[0],
-    platform.python_build()[1])
-print "Spark context available as sc."
-
-if add_files != None:
-    print "Adding files: [%s]" % ", ".join(add_files)
+    platform.python_build()[1]))
+print("SparkSession available as 'spark'.")
 
 # The ./bin/pyspark script stores the old PYTHONSTARTUP value in OLD_PYTHONSTARTUP,
 # which allows us to execute the user's PYTHONSTARTUP file:
 _pythonstartup = os.environ.get('OLD_PYTHONSTARTUP')
 if _pythonstartup and os.path.isfile(_pythonstartup):
-    execfile(_pythonstartup)
+    with open(_pythonstartup) as f:
+        code = compile(f.read(), _pythonstartup, 'exec')
+        exec(code)

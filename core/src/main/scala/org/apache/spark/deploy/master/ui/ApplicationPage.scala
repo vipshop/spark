@@ -19,97 +19,139 @@ package org.apache.spark.deploy.master.ui
 
 import javax.servlet.http.HttpServletRequest
 
-import scala.concurrent.Await
 import scala.xml.Node
 
-import akka.pattern.ask
-import org.json4s.JValue
-
-import org.apache.spark.deploy.JsonProtocol
 import org.apache.spark.deploy.DeployMessages.{MasterStateResponse, RequestMasterState}
-import org.apache.spark.deploy.master.ExecutorInfo
-import org.apache.spark.ui.UIUtils
+import org.apache.spark.deploy.ExecutorState
+import org.apache.spark.deploy.StandaloneResourceUtils.{formatResourceRequirements, formatResourcesAddresses}
+import org.apache.spark.deploy.master.ExecutorDesc
+import org.apache.spark.ui.{ToolTips, UIUtils, WebUIPage}
 import org.apache.spark.util.Utils
 
-private[spark] class ApplicationPage(parent: MasterWebUI) {
-  val master = parent.masterActorRef
-  val timeout = parent.timeout
+private[ui] class ApplicationPage(parent: MasterWebUI) extends WebUIPage("app") {
 
-  /** Executor details for a particular application */
-  def renderJson(request: HttpServletRequest): JValue = {
-    val appId = request.getParameter("appId")
-    val stateFuture = (master ? RequestMasterState)(timeout).mapTo[MasterStateResponse]
-    val state = Await.result(stateFuture, timeout)
-    val app = state.activeApps.find(_.id == appId).getOrElse({
-      state.completedApps.find(_.id == appId).getOrElse(null)
-    })
-    JsonProtocol.writeApplicationInfo(app)
-  }
+  private val master = parent.masterEndpointRef
 
   /** Executor details for a particular application */
   def render(request: HttpServletRequest): Seq[Node] = {
     val appId = request.getParameter("appId")
-    val stateFuture = (master ? RequestMasterState)(timeout).mapTo[MasterStateResponse]
-    val state = Await.result(stateFuture, timeout)
-    val app = state.activeApps.find(_.id == appId).getOrElse({
-      state.completedApps.find(_.id == appId).getOrElse(null)
-    })
+    val state = master.askSync[MasterStateResponse](RequestMasterState)
+    val app = state.activeApps.find(_.id == appId)
+      .getOrElse(state.completedApps.find(_.id == appId).orNull)
+    if (app == null) {
+      val msg = <div class="row">No running application with ID {appId}</div>
+      return UIUtils.basicSparkPage(request, msg, "Not Found")
+    }
 
-    val executorHeaders = Seq("ExecutorID", "Worker", "Cores", "Memory", "State", "Logs")
-    val executors = app.executors.values.toSeq
-    val executorTable = UIUtils.listingTable(executorHeaders, executorRow, executors)
+    val executorHeaders = Seq("ExecutorID", "Worker", "Cores", "Memory", "Resources",
+      "State", "Logs")
+    val allExecutors = (app.executors.values ++ app.removedExecutors).toSet.toSeq
+    // This includes executors that are either still running or have exited cleanly
+    val executors = allExecutors.filter { exec =>
+      !ExecutorState.isFinished(exec.state) || exec.state == ExecutorState.EXITED
+    }
+    val removedExecutors = allExecutors.diff(executors)
+    val executorsTable = UIUtils.listingTable(executorHeaders, executorRow, executors)
+    val removedExecutorsTable = UIUtils.listingTable(executorHeaders, executorRow, removedExecutors)
 
     val content =
-        <div class="row-fluid">
-          <div class="span12">
-            <ul class="unstyled">
-              <li><strong>ID:</strong> {app.id}</li>
-              <li><strong>Name:</strong> {app.desc.name}</li>
-              <li><strong>User:</strong> {app.desc.user}</li>
-              <li><strong>Cores:</strong>
+      <div class="row">
+        <div class="col-12">
+          <ul class="list-unstyled">
+            <li><strong>ID:</strong> {app.id}</li>
+            <li><strong>Name:</strong> {app.desc.name}</li>
+            <li><strong>User:</strong> {app.desc.user}</li>
+            <li><strong>Cores:</strong>
+            {
+              if (app.desc.maxCores.isEmpty) {
+                "Unlimited (%s granted)".format(app.coresGranted)
+              } else {
+                "%s (%s granted, %s left)".format(
+                  app.desc.maxCores.get, app.coresGranted, app.coresLeft)
+              }
+            }
+            </li>
+            <li>
+              <span data-toggle="tooltip" title={ToolTips.APPLICATION_EXECUTOR_LIMIT}
+                    data-placement="top">
+                <strong>Executor Limit: </strong>
                 {
-                if (app.desc.maxCores.isEmpty) {
-                  "Unlimited (%s granted)".format(app.coresGranted)
-                } else {
-                  "%s (%s granted, %s left)".format(
-                    app.desc.maxCores.get, app.coresGranted, app.coresLeft)
+                  if (app.executorLimit == Int.MaxValue) "Unlimited" else app.executorLimit
                 }
-                }
-              </li>
-              <li>
-                <strong>Executor Memory:</strong>
-                {Utils.megabytesToString(app.desc.memoryPerSlave)}
-              </li>
-              <li><strong>Submit Date:</strong> {app.submitDate}</li>
-              <li><strong>State:</strong> {app.state}</li>
-              <li><strong><a href={app.desc.appUiUrl}>Application Detail UI</a></strong></li>
-            </ul>
-          </div>
+                ({app.executors.size} granted)
+              </span>
+            </li>
+            <li>
+              <strong>Executor Memory:</strong>
+              {Utils.megabytesToString(app.desc.memoryPerExecutorMB)}
+            </li>
+            <li>
+              <strong>Executor Resources:</strong>
+              {formatResourceRequirements(app.desc.resourceReqsPerExecutor)}
+            </li>
+            <li><strong>Submit Date:</strong> {UIUtils.formatDate(app.submitDate)}</li>
+            <li><strong>State:</strong> {app.state}</li>
+            {
+              if (!app.isFinished) {
+                <li><strong>
+                    <a href={UIUtils.makeHref(parent.master.reverseProxy,
+                      app.id, app.desc.appUiUrl)}>Application Detail UI</a>
+                </strong></li>
+              }
+            }
+          </ul>
         </div>
+      </div>
 
-        <div class="row-fluid"> <!-- Executors -->
-          <div class="span12">
-            <h4> Executor Summary </h4>
-            {executorTable}
+      <div class="row"> <!-- Executors -->
+        <div class="col-12">
+          <span class="collapse-aggregated-executors collapse-table"
+              onClick="collapseTable('collapse-aggregated-executors','aggregated-executors')">
+            <h4>
+              <span class="collapse-table-arrow arrow-open"></span>
+              <a>Executor Summary ({allExecutors.length})</a>
+            </h4>
+          </span>
+          <div class="aggregated-executors collapsible-table">
+            {executorsTable}
           </div>
-        </div>;
-    UIUtils.basicSparkPage(content, "Application: " + app.desc.name)
+          {
+            if (removedExecutors.nonEmpty) {
+              <span class="collapse-aggregated-removedExecutors collapse-table"
+                  onClick="collapseTable('collapse-aggregated-removedExecutors',
+                  'aggregated-removedExecutors')">
+                <h4>
+                  <span class="collapse-table-arrow arrow-open"></span>
+                  <a>Removed Executors ({removedExecutors.length})</a>
+                </h4>
+              </span> ++
+              <div class="aggregated-removedExecutors collapsible-table">
+                {removedExecutorsTable}
+              </div>
+            }
+          }
+        </div>
+      </div>;
+    UIUtils.basicSparkPage(request, content, "Application: " + app.desc.name)
   }
 
-  def executorRow(executor: ExecutorInfo): Seq[Node] = {
+  private def executorRow(executor: ExecutorDesc): Seq[Node] = {
+    val workerUrlRef = UIUtils.makeHref(parent.master.reverseProxy,
+      executor.worker.id, executor.worker.webUiAddress)
     <tr>
       <td>{executor.id}</td>
       <td>
-        <a href={executor.worker.webUiAddress}>{executor.worker.id}</a>
+        <a href={workerUrlRef}>{executor.worker.id}</a>
       </td>
       <td>{executor.cores}</td>
       <td>{executor.memory}</td>
+      <td>{formatResourcesAddresses(executor.resources)}</td>
       <td>{executor.state}</td>
       <td>
-        <a href={"%s/logPage?appId=%s&executorId=%s&logType=stdout"
-          .format(executor.worker.webUiAddress, executor.application.id, executor.id)}>stdout</a>
-        <a href={"%s/logPage?appId=%s&executorId=%s&logType=stderr"
-          .format(executor.worker.webUiAddress, executor.application.id, executor.id)}>stderr</a>
+        <a href={s"$workerUrlRef/logPage?appId=${executor.application.id}&executorId=${executor.
+          id}&logType=stdout"}>stdout</a>
+        <a href={s"$workerUrlRef/logPage?appId=${executor.application.id}&executorId=${executor.
+          id}&logType=stderr"}>stderr</a>
       </td>
     </tr>
   }

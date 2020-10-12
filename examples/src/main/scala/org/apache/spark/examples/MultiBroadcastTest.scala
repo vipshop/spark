@@ -15,23 +15,26 @@
  * limitations under the License.
  */
 
+// scalastyle:off println
 package org.apache.spark.examples
 
-import org.apache.spark.SparkContext
 import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.SparkSession
 
+
+/**
+ * Usage: MultiBroadcastTest [partitions] [numElem]
+ */
 object MultiBroadcastTest {
-  def main(args: Array[String]) {
-    if (args.length == 0) {
-      System.err.println("Usage: MultiBroadcastTest <master> [<slices>] [numElem]")
-      System.exit(1)
-    }
+  def main(args: Array[String]): Unit = {
 
-    val sc = new SparkContext(args(0), "Multi-Broadcast Test",
-      System.getenv("SPARK_HOME"), SparkContext.jarOfClass(this.getClass))
+    val spark = SparkSession
+      .builder
+      .appName("Multi-Broadcast Test")
+      .getOrCreate()
 
-    val slices = if (args.length > 1) args(1).toInt else 2
-    val num = if (args.length > 2) args(2).toInt else 1000000
+    val slices = if (args.length > 0) args(0).toInt else 2
+    val num = if (args.length > 1) args(1).toInt else 1000000
 
     val arr1 = new Array[Int](num)
     for (i <- 0 until arr1.length) {
@@ -43,14 +46,15 @@ object MultiBroadcastTest {
       arr2(i) = i
     }
 
-    val barr1 = sc.broadcast(arr1)
-    val barr2 = sc.broadcast(arr2)
-    val observedSizes: RDD[(Int, Int)] = sc.parallelize(1 to 10, slices).map { _ =>
-      (barr1.value.size, barr2.value.size)
+    val barr1 = spark.sparkContext.broadcast(arr1)
+    val barr2 = spark.sparkContext.broadcast(arr2)
+    val observedSizes: RDD[(Int, Int)] = spark.sparkContext.parallelize(1 to 10, slices).map { _ =>
+      (barr1.value.length, barr2.value.length)
     }
     // Collect the small RDD so we can print the observed sizes locally.
     observedSizes.collect().foreach(i => println(i))
 
-    System.exit(0)
+    spark.stop()
   }
 }
+// scalastyle:on println

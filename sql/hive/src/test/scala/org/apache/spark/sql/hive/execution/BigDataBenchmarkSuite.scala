@@ -15,21 +15,20 @@
  * limitations under the License.
  */
 
-package org.apache.spark.sql
-package hive
-package execution
+package org.apache.spark.sql.hive.execution
 
 import java.io.File
+
 
 /**
  * A set of test cases based on the big-data-benchmark.
  * https://amplab.cs.berkeley.edu/benchmark/
  */
 class BigDataBenchmarkSuite extends HiveComparisonTest {
-  import TestHive._
+  import org.apache.spark.sql.hive.test.TestHive.sparkSession._
 
-  val testDataDirectory = new File("target/big-data-benchmark-testdata")
-
+  val testDataDirectory = new File("target" + File.separator + "big-data-benchmark-testdata")
+  val userVisitPath = new File(testDataDirectory, "uservisits").getCanonicalPath
   val testTables = Seq(
     TestTable(
       "rankings",
@@ -65,7 +64,7 @@ class BigDataBenchmarkSuite extends HiveComparisonTest {
         |  searchWord STRING,
         |  duration INT)
         |  ROW FORMAT DELIMITED FIELDS TERMINATED BY ","
-        |  STORED AS TEXTFILE LOCATION "${new File(testDataDirectory, "uservisits").getCanonicalPath}"
+        |  STORED AS TEXTFILE LOCATION "$userVisitPath"
       """.stripMargin.cmd),
     TestTable(
       "documents",
@@ -85,7 +84,10 @@ class BigDataBenchmarkSuite extends HiveComparisonTest {
       "SELECT pageURL, pageRank FROM rankings WHERE pageRank > 1")
 
     createQueryTest("query2",
-      "SELECT SUBSTR(sourceIP, 1, 10), SUM(adRevenue) FROM uservisits GROUP BY SUBSTR(sourceIP, 1, 10)")
+      """
+        |SELECT SUBSTR(sourceIP, 1, 10), SUM(adRevenue) FROM uservisits
+        |GROUP BY SUBSTR(sourceIP, 1, 10)
+      """.stripMargin)
 
     createQueryTest("query3",
       """
@@ -115,8 +117,8 @@ class BigDataBenchmarkSuite extends HiveComparisonTest {
         |CREATE TABLE url_counts_total AS
         |  SELECT SUM(count) AS totalCount, destpage
         |  FROM url_counts_partial GROUP BY destpage
-        |-- The following queries run, but generate different results in HIVE likely because the UDF is not deterministic
-        |-- given different input splits.
+        |-- The following queries run, but generate different results in HIVE
+        |-- likely because the UDF is not deterministic given different input splits.
         |-- SELECT CAST(SUM(count) AS INT) FROM url_counts_partial
         |-- SELECT COUNT(*) FROM url_counts_partial
         |-- SELECT * FROM url_counts_partial

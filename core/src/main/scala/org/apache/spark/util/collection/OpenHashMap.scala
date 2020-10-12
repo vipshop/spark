@@ -25,9 +25,12 @@ import scala.reflect.ClassTag
  * space overhead.
  *
  * Under the hood, it uses our OpenHashSet implementation.
+ *
+ * NOTE: when using numeric type as the value type, the user of this class should be careful to
+ * distinguish between the 0/0.0/0L and non-exist value
  */
 private[spark]
-class OpenHashMap[K >: Null : ClassTag, @specialized(Long, Int, Double) V: ClassTag](
+class OpenHashMap[K : ClassTag, @specialized(Long, Int, Double) V: ClassTag](
     initialCapacity: Int)
   extends Iterable[(K, V)]
   with Serializable {
@@ -49,6 +52,15 @@ class OpenHashMap[K >: Null : ClassTag, @specialized(Long, Int, Double) V: Class
 
   override def size: Int = if (haveNullValue) _keySet.size + 1 else _keySet.size
 
+  /** Tests whether this map contains a binding for a key. */
+  def contains(k: K): Boolean = {
+    if (k == null) {
+      haveNullValue
+    } else {
+      _keySet.getPos(k) != OpenHashSet.INVALID_POS
+    }
+  }
+
   /** Get the value for a given key */
   def apply(k: K): V = {
     if (k == null) {
@@ -64,7 +76,7 @@ class OpenHashMap[K >: Null : ClassTag, @specialized(Long, Int, Double) V: Class
   }
 
   /** Set the value for a key */
-  def update(k: K, v: V) {
+  def update(k: K, v: V): Unit = {
     if (k == null) {
       haveNullValue = true
       nullValue = v
@@ -105,7 +117,7 @@ class OpenHashMap[K >: Null : ClassTag, @specialized(Long, Int, Double) V: Class
     }
   }
 
-  override def iterator = new Iterator[(K, V)] {
+  override def iterator: Iterator[(K, V)] = new Iterator[(K, V)] {
     var pos = -1
     var nextPair: (K, V) = computeNextPair()
 
@@ -128,9 +140,9 @@ class OpenHashMap[K >: Null : ClassTag, @specialized(Long, Int, Double) V: Class
       }
     }
 
-    def hasNext = nextPair != null
+    def hasNext: Boolean = nextPair != null
 
-    def next() = {
+    def next(): (K, V) = {
       val pair = nextPair
       nextPair = computeNextPair()
       pair

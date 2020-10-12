@@ -18,19 +18,16 @@
 package org.apache.spark.streaming.util
 
 import org.apache.spark.SparkContext
-import org.apache.spark.SparkContext._
-import it.unimi.dsi.fastutil.objects.{Object2LongOpenHashMap => OLMap}
-import scala.collection.JavaConversions.mapAsScalaMap
+import org.apache.spark.util.collection.OpenHashMap
 
 private[streaming]
 object RawTextHelper {
 
-  /** 
-   * Splits lines and counts the words in them using specialized object-to-long hashmap 
-   * (to avoid boxing-unboxing overhead of Long in java/scala HashMap)
+  /**
+   * Splits lines and counts the words.
    */
   def splitAndCountPartitions(iter: Iterator[String]): Iterator[(String, Long)] = {
-    val map = new OLMap[String]
+    val map = new OpenHashMap[String, Long]
     var i = 0
     var j = 0
     while (iter.hasNext) {
@@ -43,34 +40,35 @@ object RawTextHelper {
         }
         if (j > i) {
           val w = s.substring(i, j)
-          val c = map.getLong(w)
-          map.put(w, c + 1)
+          map.changeValue(w, 1L, _ + 1L)
         }
         i = j
         while (i < s.length && s.charAt(i) == ' ') {
           i += 1
         }
       }
+      map.toIterator.map {
+        case (k, v) => (k, v)
+      }
     }
     map.toIterator.map{case (k, v) => (k, v)}
   }
 
-  /** 
+  /**
    * Gets the top k words in terms of word counts. Assumes that each word exists only once
    * in the `data` iterator (that is, the counts have been reduced).
    */
   def topK(data: Iterator[(String, Long)], k: Int): Iterator[(String, Long)] = {
     val taken = new Array[(String, Long)](k)
-    
+
     var i = 0
     var len = 0
-    var done = false
     var value: (String, Long) = null
     var swap: (String, Long) = null
     var count = 0
 
     while(data.hasNext) {
-      value = data.next
+      value = data.next()
       if (value != null) {
         count += 1
         if (len == 0) {
@@ -93,24 +91,27 @@ object RawTextHelper {
     }
     taken.toIterator
   }
- 
+
   /**
-   * Warms up the SparkContext in master and slave by running tasks to force JIT kick in
+   * Warms up the SparkContext in master and executor by running tasks to force JIT kick in
    * before real workload starts.
    */
-  def warmUp(sc: SparkContext) {
-    for(i <- 0 to 1) {
+  def warmUp(sc: SparkContext): Unit = {
+    for (i <- 0 to 1) {
       sc.parallelize(1 to 200000, 1000)
         .map(_ % 1331).map(_.toString)
         .mapPartitions(splitAndCountPartitions).reduceByKey(_ + _, 10)
         .count()
     }
   }
-  
-  def add(v1: Long, v2: Long) = (v1 + v2) 
 
-  def subtract(v1: Long, v2: Long) = (v1 - v2) 
+  def add(v1: Long, v2: Long): Long = {
+    v1 + v2
+  }
 
-  def max(v1: Long, v2: Long) = math.max(v1, v2) 
+  def subtract(v1: Long, v2: Long): Long = {
+    v1 - v2
+  }
+
+  def max(v1: Long, v2: Long): Long = math.max(v1, v2)
 }
-

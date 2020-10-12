@@ -7,7 +7,7 @@ set hive.groupby.skewindata=true;
 CREATE TABLE T1(key STRING, val STRING)
 CLUSTERED BY (key) SORTED BY (key) INTO 2 BUCKETS STORED AS TEXTFILE;
 
-LOAD DATA LOCAL INPATH '../data/files/T1.txt' INTO TABLE T1;
+LOAD DATA LOCAL INPATH '../../data/files/T1.txt' INTO TABLE T1;
 
 -- perform an insert to make sure there are 2 files
 INSERT OVERWRITE TABLE T1 select key, val from T1;
@@ -249,7 +249,7 @@ SELECT * FROM outputTbl4 ORDER BY key1, key2, key3;
 
 set hive.map.aggr=true;
 set hive.multigroupby.singlereducer=false;
-set mapred.reduce.tasks=31;
+set mapreduce.job.reduces=31;
 
 CREATE TABLE DEST1(key INT, cnt INT);
 CREATE TABLE DEST2(key INT, val STRING, cnt INT);

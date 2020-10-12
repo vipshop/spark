@@ -15,8 +15,9 @@
  * limitations under the License.
  */
 
-package org.apache.spark.sql
-package catalyst
+package org.apache.spark.sql.catalyst
+
+import org.apache.spark.internal.Logging
 
 /**
  * A library for easily manipulating trees of operators.  Operators that extend TreeNode are
@@ -32,7 +33,19 @@ package catalyst
  *   <li>debugging support - pretty printing, easy splicing of trees, etc.</li>
  * </ul>
  */
-package object trees {
+package object trees extends Logging {
   // Since we want tree nodes to be lightweight, we create one logger for all treenode instances.
-  protected val logger = Logger("catalyst.trees")
+  protected override def logName = "catalyst.trees"
+
+  /**
+   * A [[TreeNode]] companion for reference equality for Hash based Collection.
+   */
+  class TreeNodeRef(val obj: TreeNode[_]) {
+    override def equals(o: Any): Boolean = o match {
+      case that: TreeNodeRef => that.obj.eq(obj)
+      case _ => false
+    }
+
+    override def hashCode: Int = if (obj == null) 0 else obj.hashCode
+  }
 }

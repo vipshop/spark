@@ -19,88 +19,73 @@ package org.apache.spark.storage
 
 import java.io.{File, FileWriter}
 
-import scala.collection.mutable
+import org.scalatest.{BeforeAndAfterAll, BeforeAndAfterEach}
 
-import com.google.common.io.Files
-import org.scalatest.{BeforeAndAfterEach, FunSuite}
+import org.apache.spark.{SparkConf, SparkFunSuite}
+import org.apache.spark.util.Utils
 
-import org.apache.spark.SparkConf
-
-class DiskBlockManagerSuite extends FunSuite with BeforeAndAfterEach {
+class DiskBlockManagerSuite extends SparkFunSuite with BeforeAndAfterEach with BeforeAndAfterAll {
   private val testConf = new SparkConf(false)
-  val rootDir0 = Files.createTempDir()
-  rootDir0.deleteOnExit()
-  val rootDir1 = Files.createTempDir()
-  rootDir1.deleteOnExit()
-  val rootDirs = rootDir0.getName + "," + rootDir1.getName
-  println("Created root dirs: " + rootDirs)
-
-  // This suite focuses primarily on consolidation features,
-  // so we coerce consolidation if not already enabled.
-  testConf.set("spark.shuffle.consolidateFiles", "true")
-
-  val shuffleBlockManager = new ShuffleBlockManager(null) {
-    override def conf = testConf.clone
-    var idToSegmentMap = mutable.Map[ShuffleBlockId, FileSegment]()
-    override def getBlockLocation(id: ShuffleBlockId) = idToSegmentMap(id)
-  }
+  private var rootDir0: File = _
+  private var rootDir1: File = _
+  private var rootDirs: String = _
 
   var diskBlockManager: DiskBlockManager = _
 
-  override def beforeEach() {
-    diskBlockManager = new DiskBlockManager(shuffleBlockManager, rootDirs)
-    shuffleBlockManager.idToSegmentMap.clear()
+  override def beforeAll(): Unit = {
+    super.beforeAll()
+    rootDir0 = Utils.createTempDir()
+    rootDir1 = Utils.createTempDir()
+    rootDirs = rootDir0.getAbsolutePath + "," + rootDir1.getAbsolutePath
+  }
+
+  override def afterAll(): Unit = {
+    try {
+      Utils.deleteRecursively(rootDir0)
+      Utils.deleteRecursively(rootDir1)
+    } finally {
+      super.afterAll()
+    }
+  }
+
+  override def beforeEach(): Unit = {
+    super.beforeEach()
+    val conf = testConf.clone
+    conf.set("spark.local.dir", rootDirs)
+    diskBlockManager = new DiskBlockManager(conf, deleteFilesOnStop = true)
+  }
+
+  override def afterEach(): Unit = {
+    try {
+      diskBlockManager.stop()
+    } finally {
+      super.afterEach()
+    }
   }
 
   test("basic block creation") {
     val blockId = new TestBlockId("test")
-    assertSegmentEquals(blockId, blockId.name, 0, 0)
-
     val newFile = diskBlockManager.getFile(blockId)
     writeToFile(newFile, 10)
-    assertSegmentEquals(blockId, blockId.name, 0, 10)
-
+    assert(diskBlockManager.containsBlock(blockId))
     newFile.delete()
+    assert(!diskBlockManager.containsBlock(blockId))
   }
 
-  test("block appending") {
-    val blockId = new TestBlockId("test")
-    val newFile = diskBlockManager.getFile(blockId)
-    writeToFile(newFile, 15)
-    assertSegmentEquals(blockId, blockId.name, 0, 15)
-    val newFile2 = diskBlockManager.getFile(blockId)
-    assert(newFile === newFile2)
-    writeToFile(newFile2, 12)
-    assertSegmentEquals(blockId, blockId.name, 0, 27)
-    newFile.delete()
+  test("enumerating blocks") {
+    val ids = (1 to 100).map(i => TestBlockId("test_" + i))
+    val files = ids.map(id => diskBlockManager.getFile(id))
+    files.foreach(file => writeToFile(file, 10))
+    assert(diskBlockManager.getAllBlocks.toSet === ids.toSet)
   }
 
-  test("block remapping") {
-    val filename = "test"
-    val blockId0 = new ShuffleBlockId(1, 2, 3)
-    val newFile = diskBlockManager.getFile(filename)
-    writeToFile(newFile, 15)
-    shuffleBlockManager.idToSegmentMap(blockId0) = new FileSegment(newFile, 0, 15)
-    assertSegmentEquals(blockId0, filename, 0, 15)
-
-    val blockId1 = new ShuffleBlockId(1, 2, 4)
-    val newFile2 = diskBlockManager.getFile(filename)
-    writeToFile(newFile2, 12)
-    shuffleBlockManager.idToSegmentMap(blockId1) = new FileSegment(newFile, 15, 12)
-    assertSegmentEquals(blockId1, filename, 15, 12)
-
-    assert(newFile === newFile2)
-    newFile.delete()
+  test("SPARK-22227: non-block files are skipped") {
+    val file = diskBlockManager.getFile("unmanaged_file")
+    writeToFile(file, 10)
+    assert(diskBlockManager.getAllBlocks().isEmpty)
   }
 
-  def assertSegmentEquals(blockId: BlockId, filename: String, offset: Int, length: Int) {
-    val segment = diskBlockManager.getBlockLocation(blockId)
-    assert(segment.file.getName === filename)
-    assert(segment.offset === offset)
-    assert(segment.length === length)
-  }
-
-  def writeToFile(file: File, numBytes: Int) {
+  def writeToFile(file: File, numBytes: Int): Unit = {
     val writer = new FileWriter(file, true)
     for (i <- 0 until numBytes) writer.write(i)
     writer.close()

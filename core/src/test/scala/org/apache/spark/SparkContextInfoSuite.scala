@@ -17,15 +17,20 @@
 
 package org.apache.spark
 
-import org.scalatest.{Assertions, FunSuite}
+import scala.concurrent.duration._
 
-class SparkContextInfoSuite extends FunSuite with LocalSparkContext {
+import org.scalatest.Assertions
+import org.scalatest.concurrent.Eventually._
+
+import org.apache.spark.storage.StorageLevel
+
+class SparkContextInfoSuite extends SparkFunSuite with LocalSparkContext {
   test("getPersistentRDDs only returns RDDs that are marked as cached") {
     sc = new SparkContext("local", "test")
-    assert(sc.getPersistentRDDs.isEmpty === true)
+    assert(sc.getPersistentRDDs.isEmpty)
 
     val rdd = sc.makeRDD(Array(1, 2, 3, 4), 2)
-    assert(sc.getPersistentRDDs.isEmpty === true)
+    assert(sc.getPersistentRDDs.isEmpty)
 
     rdd.cache()
     assert(sc.getPersistentRDDs.size === 1)
@@ -35,26 +40,36 @@ class SparkContextInfoSuite extends FunSuite with LocalSparkContext {
   test("getPersistentRDDs returns an immutable map") {
     sc = new SparkContext("local", "test")
     val rdd1 = sc.makeRDD(Array(1, 2, 3, 4), 2).cache()
-
     val myRdds = sc.getPersistentRDDs
     assert(myRdds.size === 1)
-    assert(myRdds.values.head === rdd1)
+    assert(myRdds(0) === rdd1)
+    assert(myRdds(0).getStorageLevel === StorageLevel.MEMORY_ONLY)
 
+    // myRdds2 should have 2 RDDs, but myRdds should not change
     val rdd2 = sc.makeRDD(Array(5, 6, 7, 8), 1).cache()
-
-    // getPersistentRDDs should have 2 RDDs, but myRdds should not change
-    assert(sc.getPersistentRDDs.size === 2)
+    val myRdds2 = sc.getPersistentRDDs
+    assert(myRdds2.size === 2)
+    assert(myRdds2(0) === rdd1)
+    assert(myRdds2(1) === rdd2)
+    assert(myRdds2(0).getStorageLevel === StorageLevel.MEMORY_ONLY)
+    assert(myRdds2(1).getStorageLevel === StorageLevel.MEMORY_ONLY)
     assert(myRdds.size === 1)
+    assert(myRdds(0) === rdd1)
+    assert(myRdds(0).getStorageLevel === StorageLevel.MEMORY_ONLY)
   }
 
   test("getRDDStorageInfo only reports on RDDs that actually persist data") {
     sc = new SparkContext("local", "test")
     val rdd = sc.makeRDD(Array(1, 2, 3, 4), 2).cache()
-
-    assert(sc.getRDDStorageInfo.size === 0)
-
+    assert(sc.getRDDStorageInfo.length === 0)
     rdd.collect()
-    assert(sc.getRDDStorageInfo.size === 1)
+    sc.listenerBus.waitUntilEmpty()
+    eventually(timeout(10.seconds), interval(100.milliseconds)) {
+      assert(sc.getRDDStorageInfo.length === 1)
+    }
+    assert(sc.getRDDStorageInfo.head.isCached)
+    assert(sc.getRDDStorageInfo.head.memSize > 0)
+    assert(sc.getRDDStorageInfo.head.storageLevel === StorageLevel.MEMORY_ONLY)
   }
 
   test("call sites report correct locations") {
@@ -67,26 +82,24 @@ class SparkContextInfoSuite extends FunSuite with LocalSparkContext {
 package object testPackage extends Assertions {
   private val CALL_SITE_REGEX = "(.+) at (.+):([0-9]+)".r
 
-  def runCallSiteTest(sc: SparkContext) {
+  def runCallSiteTest(sc: SparkContext): Unit = {
     val rdd = sc.makeRDD(Array(1, 2, 3, 4), 2)
     val rddCreationSite = rdd.getCreationSite
-    val curCallSite = sc.getCallSite() // note: 2 lines after definition of "rdd"
+    val curCallSite = sc.getCallSite().shortForm // note: 2 lines after definition of "rdd"
 
     val rddCreationLine = rddCreationSite match {
-      case CALL_SITE_REGEX(func, file, line) => {
+      case CALL_SITE_REGEX(func, file, line) =>
         assert(func === "makeRDD")
         assert(file === "SparkContextInfoSuite.scala")
         line.toInt
-      }
       case _ => fail("Did not match expected call site format")
     }
 
     curCallSite match {
-      case CALL_SITE_REGEX(func, file, line) => {
+      case CALL_SITE_REGEX(func, file, line) =>
         assert(func === "getCallSite") // this is correct because we called it from outside of Spark
         assert(file === "SparkContextInfoSuite.scala")
         assert(line.toInt === rddCreationLine.toInt + 2)
-      }
       case _ => fail("Did not match expected call site format")
     }
   }

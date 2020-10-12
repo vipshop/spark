@@ -20,8 +20,10 @@ package org.apache.spark.deploy.master
 import java.util.Date
 
 import org.apache.spark.deploy.DriverDescription
+import org.apache.spark.resource.ResourceInformation
+import org.apache.spark.util.Utils
 
-private[spark] class DriverInfo(
+private[deploy] class DriverInfo(
     val startTime: Long,
     val id: String,
     val desc: DriverDescription,
@@ -33,4 +35,24 @@ private[spark] class DriverInfo(
   @transient var exception: Option[Exception] = None
   /* Most recent worker assigned to this driver */
   @transient var worker: Option[WorkerInfo] = None
+  // resources(e.f. gpu/fpga) allocated to this driver
+  // map from resource name to ResourceInformation
+  private var _resources: Map[String, ResourceInformation] = Map.empty
+
+  init()
+
+  private def readObject(in: java.io.ObjectInputStream): Unit = Utils.tryOrIOException {
+    in.defaultReadObject()
+    init()
+  }
+
+  private def init(): Unit = {
+    state = DriverState.SUBMITTED
+    worker = None
+    exception = None
+  }
+
+  def withResources(r: Map[String, ResourceInformation]): Unit = _resources = r
+
+  def resources: Map[String, ResourceInformation] = _resources
 }

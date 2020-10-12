@@ -1,143 +1,67 @@
 ---
 layout: global
-title: Spark SQL Programming Guide
+displayTitle: Spark SQL, DataFrames and Datasets Guide
+title: Spark SQL and DataFrames
+license: |
+  Licensed to the Apache Software Foundation (ASF) under one or more
+  contributor license agreements.  See the NOTICE file distributed with
+  this work for additional information regarding copyright ownership.
+  The ASF licenses this file to You under the Apache License, Version 2.0
+  (the "License"); you may not use this file except in compliance with
+  the License.  You may obtain a copy of the License at
+ 
+     http://www.apache.org/licenses/LICENSE-2.0
+ 
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
 ---
-**Spark SQL is currently an Alpha component. Therefore, the APIs may be changed in future releases.**
 
-* This will become a table of contents (this text will be scraped).
-{:toc}
+Spark SQL is a Spark module for structured data processing. Unlike the basic Spark RDD API, the interfaces provided
+by Spark SQL provide Spark with more information about the structure of both the data and the computation being performed. Internally,
+Spark SQL uses this extra information to perform extra optimizations. There are several ways to
+interact with Spark SQL including SQL and the Dataset API. When computing a result,
+the same execution engine is used, independent of which API/language you are using to express the
+computation. This unification means that developers can easily switch back and forth between
+different APIs based on which provides the most natural way to express a given transformation.
 
-# Overview
-Spark SQL allows relational queries expressed in SQL, HiveQL, or Scala to be executed using
-Spark.  At the core of this component is a new type of RDD,
-[SchemaRDD](api/sql/core/index.html#org.apache.spark.sql.SchemaRDD).  SchemaRDDs are composed
-[Row](api/sql/catalyst/index.html#org.apache.spark.sql.catalyst.expressions.Row) objects along with
-a schema that describes the data types of each column in the row.  A SchemaRDD is similar to a table
-in a traditional relational database.  A SchemaRDD can be created from an existing RDD, parquet
-file, or by running HiveQL against data stored in [Apache Hive](http://hive.apache.org/).
+All of the examples on this page use sample data included in the Spark distribution and can be run in
+the `spark-shell`, `pyspark` shell, or `sparkR` shell.
 
-**All of the examples on this page use sample data included in the Spark distribution and can be run in the spark-shell.**
+## SQL
 
-***************************************************************************************************
+One use of Spark SQL is to execute SQL queries.
+Spark SQL can also be used to read data from an existing Hive installation. For more on how to
+configure this feature, please refer to the [Hive Tables](sql-data-sources-hive-tables.html) section. When running
+SQL from within another programming language the results will be returned as a [Dataset/DataFrame](#datasets-and-dataframes).
+You can also interact with the SQL interface using the [command-line](sql-distributed-sql-engine.html#running-the-spark-sql-cli)
+or over [JDBC/ODBC](sql-distributed-sql-engine.html#running-the-thrift-jdbcodbc-server).
 
-# Getting Started
+## Datasets and DataFrames
 
-The entry point into all relational functionallity in Spark is the
-[SQLContext](api/sql/core/index.html#org.apache.spark.sql.SQLContext) class, or one of its
-decendents.  To create a basic SQLContext, all you need is a SparkContext.
+A Dataset is a distributed collection of data.
+Dataset is a new interface added in Spark 1.6 that provides the benefits of RDDs (strong
+typing, ability to use powerful lambda functions) with the benefits of Spark SQL's optimized
+execution engine. A Dataset can be [constructed](sql-getting-started.html#creating-datasets) from JVM objects and then
+manipulated using functional transformations (`map`, `flatMap`, `filter`, etc.).
+The Dataset API is available in [Scala][scala-datasets] and
+[Java][java-datasets]. Python does not have the support for the Dataset API. But due to Python's dynamic nature,
+many of the benefits of the Dataset API are already available (i.e. you can access the field of a row by name naturally
+`row.columnName`). The case for R is similar.
 
-{% highlight scala %}
-val sc: SparkContext // An existing SparkContext.
-val sqlContext = new org.apache.spark.sql.SQLContext(sc)
+A DataFrame is a *Dataset* organized into named columns. It is conceptually
+equivalent to a table in a relational database or a data frame in R/Python, but with richer
+optimizations under the hood. DataFrames can be constructed from a wide array of [sources](sql-data-sources.html) such
+as: structured data files, tables in Hive, external databases, or existing RDDs.
+The DataFrame API is available in Scala,
+Java, [Python](api/python/pyspark.sql.html#pyspark.sql.DataFrame), and [R](api/R/index.html).
+In Scala and Java, a DataFrame is represented by a Dataset of `Row`s.
+In [the Scala API][scala-datasets], `DataFrame` is simply a type alias of `Dataset[Row]`.
+While, in [Java API][java-datasets], users need to use `Dataset<Row>` to represent a `DataFrame`.
 
-// Importing the SQL context gives access to all the public SQL functions and implicit conversions.
-import sqlContext._
-{% endhighlight %}
+[scala-datasets]: api/scala/org/apache/spark/sql/Dataset.html
+[java-datasets]: api/java/index.html?org/apache/spark/sql/Dataset.html
 
-## Running SQL on RDDs
-One type of table that is supported by Spark SQL is an RDD of Scala case classetees.  The case class
-defines the schema of the table.  The names of the arguments to the case class are read using
-reflection and become the names of the columns. Case classes can also be nested or contain complex
-types such as Sequences or Arrays. This RDD can be implicitly converted to a SchemaRDD and then be
-registered as a table.  Tables can used in subsequent SQL statements.
-
-{% highlight scala %}
-val sqlContext = new org.apache.spark.sql.SQLContext(sc)
-import sqlContext._
-
-// Define the schema using a case class.
-case class Person(name: String, age: Int)
-
-// Create an RDD of Person objects and register it as a table.
-val people = sc.textFile("examples/src/main/resources/people.txt").map(_.split(",")).map(p => Person(p(0), p(1).trim.toInt))
-people.registerAsTable("people")
-
-// SQL statements can be run by using the sql methods provided by sqlContext.
-val teenagers = sql("SELECT name FROM people WHERE age >= 13 AND age <= 19")
-
-// The results of SQL queries are SchemaRDDs and support all the normal RDD operations.
-// The columns of a row in the result can be accessed by ordinal.
-teenagers.map(t => "Name: " + t(0)).collect().foreach(println)
-{% endhighlight %}
-
-**Note that Spark SQL currently uses a very basic SQL parser, and the keywords are case sensitive.**
-Users that want a more complete dialect of SQL should look at the HiveQL support provided by
-`HiveContext`.
-
-## Using Parquet
-
-Parquet is a columnar format that is supported by many other data processing systems.  Spark SQL
-provides support for both reading and writing parquet files that automatically preserves the schema
-of the original data.  Using the data from the above example:
-
-{% highlight scala %}
-val sqlContext = new org.apache.spark.sql.SQLContext(sc)
-import sqlContext._
-
-val people: RDD[Person] // An RDD of case class objects, from the previous example.
-
-// The RDD is implicitly converted to a SchemaRDD, allowing it to be stored using parquet.
-people.saveAsParquetFile("people.parquet")
-
-// Read in the parquet file created above.  Parquet files are self-describing so the schema is preserved.
-// The result of loading a parquet file is also a SchemaRDD.
-val parquetFile = sqlContext.parquetFile("people.parquet")
-
-//Parquet files can also be registered as tables and then used in SQL statements.
-parquetFile.registerAsTable("parquetFile")
-val teenagers = sql("SELECT name FROM parquetFile WHERE age >= 13 AND age <= 19")
-teenagers.collect().foreach(println)
-{% endhighlight %}
-
-## Writing Language-Integrated Relational Queries
-
-Spark SQL also supports a domain specific language for writing queries.  Once again,
-using the data from the above examples:
-
-{% highlight scala %}
-val sqlContext = new org.apache.spark.sql.SQLContext(sc)
-import sqlContext._
-val people: RDD[Person] // An RDD of case class objects, from the first example.
-
-// The following is the same as 'SELECT name FROM people WHERE age >= 10 AND age <= 19'
-val teenagers = people.where('age >= 10).where('age <= 19).select('name)
-{% endhighlight %}
-
-The DSL uses Scala symbols to represent columns in the underlying table, which are identifiers
-prefixed with a tick (`'`).  Implicit conversions turn these symbols into expressions that are
-evaluated by the SQL execution engine.  A full list of the functions supported can be found in the
-[ScalaDoc](api/sql/core/index.html#org.apache.spark.sql.SchemaRDD).
-
-<!-- TODO: Include the table of operations here. -->
-
-# Hive Support
-
-Spark SQL also supports reading and writing data stored in [Apache Hive](http://hive.apache.org/).
-However, since Hive has a large number of dependencies, it is not included in the default Spark assembly.
-In order to use Hive you must first run '`sbt/sbt hive/assembly`'.  This command builds a new assembly
-jar that includes Hive.  When this jar is present, Spark will use the Hive
-assembly instead of the normal Spark assembly.  Note that this Hive assembly jar must also be present
-on all of the worker nodes, as they will need access to the Hive serialization and deserialization libraries
-(SerDes) in order to acccess data stored in Hive.
-
-Configuration of Hive is done by placing your `hive-site.xml` file in `conf/`.
-
-When working with Hive one must construct a `HiveContext`, which inherits from `SQLContext`, and
-adds support for finding tables in in the MetaStore and writing queries using HiveQL. Users who do
-not have an existing Hive deployment can also experiment with the `LocalHiveContext`,
-which is similar to `HiveContext`, but creates a local copy of the `metastore` and `warehouse`
-automatically.
-
-{% highlight scala %}
-val sc: SparkContext // An existing SparkContext.
-val hiveContext = new org.apache.spark.sql.hive.HiveContext(sc)
-
-// Importing the SQL context gives access to all the public SQL functions and implicit conversions.
-import hiveContext._
-
-sql("CREATE TABLE IF NOT EXISTS src (key INT, value STRING)")
-sql("LOAD DATA LOCAL INPATH 'examples/src/main/resources/kv1.txt' INTO TABLE src")
-
-// Queries are expressed in HiveQL
-sql("SELECT key, value FROM src").collect().foreach(println)
-{% endhighlight %}
+Throughout this document, we will often refer to Scala/Java Datasets of `Row`s as DataFrames.

@@ -17,15 +17,14 @@
 
 package org.apache.spark.streaming.util
 
-import java.io.IOException
+import java.io.{ByteArrayOutputStream, IOException}
 import java.net.ServerSocket
 import java.nio.ByteBuffer
 
 import scala.io.Source
 
-import it.unimi.dsi.fastutil.io.FastByteArrayOutputStream
-
-import org.apache.spark.{SparkConf, Logging}
+import org.apache.spark.SparkConf
+import org.apache.spark.internal.Logging
 import org.apache.spark.serializer.KryoSerializer
 import org.apache.spark.util.IntParam
 
@@ -35,9 +34,11 @@ import org.apache.spark.util.IntParam
  */
 private[streaming]
 object RawTextSender extends Logging {
-  def main(args: Array[String]) {
+  def main(args: Array[String]): Unit = {
     if (args.length != 4) {
+      // scalastyle:off println
       System.err.println("Usage: RawTextSender <port> <file> <blockSize> <bytesPerSec>")
+      // scalastyle:on println
       System.exit(1)
     }
     // Parse the arguments using a pattern match
@@ -45,16 +46,15 @@ object RawTextSender extends Logging {
 
     // Repeat the input data multiple times to fill in a buffer
     val lines = Source.fromFile(file).getLines().toArray
-    val bufferStream = new FastByteArrayOutputStream(blockSize + 1000)
+    val bufferStream = new ByteArrayOutputStream(blockSize + 1000)
     val ser = new KryoSerializer(new SparkConf()).newInstance()
     val serStream = ser.serializeStream(bufferStream)
     var i = 0
-    while (bufferStream.position < blockSize) {
+    while (bufferStream.size < blockSize) {
       serStream.writeObject(lines(i))
       i = (i + 1) % lines.length
     }
-    bufferStream.trim()
-    val array = bufferStream.array
+    val array = bufferStream.toByteArray
 
     val countBuf = ByteBuffer.wrap(new Array[Byte](4))
     countBuf.putInt(array.length)
@@ -75,7 +75,8 @@ object RawTextSender extends Logging {
       } catch {
         case e: IOException =>
           logError("Client disconnected")
-          socket.close()
+      } finally {
+        socket.close()
       }
     }
   }

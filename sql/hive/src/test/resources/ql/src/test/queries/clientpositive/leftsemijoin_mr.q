@@ -1,7 +1,7 @@
 CREATE TABLE T1(key INT);
-LOAD DATA LOCAL INPATH '../data/files/leftsemijoin_mr_t1.txt' INTO TABLE T1;
+LOAD DATA LOCAL INPATH '../../data/files/leftsemijoin_mr_t1.txt' INTO TABLE T1;
 CREATE TABLE T2(key INT);
-LOAD DATA LOCAL INPATH '../data/files/leftsemijoin_mr_t2.txt' INTO TABLE T2;
+LOAD DATA LOCAL INPATH '../../data/files/leftsemijoin_mr_t2.txt' INTO TABLE T2;
 
 -- Run this query using TestMinimrCliDriver
 
@@ -9,7 +9,7 @@ SELECT * FROM T1;
 SELECT * FROM T2;
 
 set hive.auto.convert.join=false;
-set mapred.reduce.tasks=2;
+set mapreduce.job.reduces=2;
 
 set hive.join.emit.interval=100;
 

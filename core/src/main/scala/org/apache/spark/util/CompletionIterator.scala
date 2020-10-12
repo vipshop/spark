@@ -22,25 +22,29 @@ package org.apache.spark.util
  * through all the elements.
  */
 private[spark]
-// scalastyle:off
 abstract class CompletionIterator[ +A, +I <: Iterator[A]](sub: I) extends Iterator[A] {
-// scalastyle:on
-  def next() = sub.next()
-  def hasNext = {
-    val r = sub.hasNext
-    if (!r) {
+
+  private[this] var completed = false
+  private[this] var iter = sub
+  def next(): A = iter.next()
+  def hasNext: Boolean = {
+    val r = iter.hasNext
+    if (!r && !completed) {
+      completed = true
+      // reassign to release resources of highly resource consuming iterators early
+      iter = Iterator.empty.asInstanceOf[I]
       completion()
     }
     r
   }
 
-  def completion()
+  def completion(): Unit
 }
 
 private[spark] object CompletionIterator {
-  def apply[A, I <: Iterator[A]](sub: I, completionFunction: => Unit) : CompletionIterator[A,I] = {
-    new CompletionIterator[A,I](sub) {
-      def completion() = completionFunction
+  def apply[A, I <: Iterator[A]](sub: I, completionFunction: => Unit) : CompletionIterator[A, I] = {
+    new CompletionIterator[A, I](sub) {
+      def completion(): Unit = completionFunction
     }
   }
 }

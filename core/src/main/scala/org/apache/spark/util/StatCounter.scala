@@ -17,11 +17,13 @@
 
 package org.apache.spark.util
 
+import org.apache.spark.annotation.Since
+
 /**
  * A class for tracking the statistics of a set of numbers (count, mean and variance) in a
  * numerically robust way. Includes support for merging two StatCounters. Based on Welford
- * and Chan's [[http://en.wikipedia.org/wiki/Algorithms_for_calculating_variance algorithms]]
- * for running variance.
+ * and Chan's <a href="http://en.wikipedia.org/wiki/Algorithms_for_calculating_variance">
+ * algorithms</a> for running variance.
  *
  * @constructor Initialize the StatCounter with the given values.
  */
@@ -62,10 +64,10 @@ class StatCounter(values: TraversableOnce[Double]) extends Serializable {
       if (n == 0) {
         mu = other.mu
         m2 = other.m2
-        n = other.n  
+        n = other.n
         maxValue = other.maxValue
         minValue = other.minValue
-      } else if (other.n != 0) {        
+      } else if (other.n != 0) {
         val delta = other.mu - mu
         if (other.n * 10 < n) {
           mu = mu + (delta * other.n) / (n + other.n)
@@ -104,8 +106,14 @@ class StatCounter(values: TraversableOnce[Double]) extends Serializable {
 
   def min: Double = minValue
 
-  /** Return the variance of the values. */
-  def variance: Double = {
+  /** Return the population variance of the values. */
+  def variance: Double = popVariance
+
+  /**
+   * Return the population variance of the values.
+   */
+  @Since("2.1.0")
+  def popVariance: Double = {
     if (n == 0) {
       Double.NaN
     } else {
@@ -125,8 +133,14 @@ class StatCounter(values: TraversableOnce[Double]) extends Serializable {
     }
   }
 
-  /** Return the standard deviation of the values. */
-  def stdev: Double = math.sqrt(variance)
+  /** Return the population standard deviation of the values. */
+  def stdev: Double = popStdev
+
+  /**
+   * Return the population standard deviation of the values.
+   */
+  @Since("2.1.0")
+  def popStdev: Double = math.sqrt(popVariance)
 
   /**
    * Return the sample standard deviation of the values, which corrects for bias in estimating the
@@ -141,8 +155,8 @@ class StatCounter(values: TraversableOnce[Double]) extends Serializable {
 
 object StatCounter {
   /** Build a StatCounter from a list of values. */
-  def apply(values: TraversableOnce[Double]) = new StatCounter(values)
+  def apply(values: TraversableOnce[Double]): StatCounter = new StatCounter(values)
 
   /** Build a StatCounter from a list of values passed as variable-length arguments. */
-  def apply(values: Double*) = new StatCounter(values)
+  def apply(values: Double*): StatCounter = new StatCounter(values)
 }

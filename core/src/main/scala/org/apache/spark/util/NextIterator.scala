@@ -19,7 +19,7 @@ package org.apache.spark.util
 
 /** Provides a basic/boilerplate Iterator implementation. */
 private[spark] abstract class NextIterator[U] extends Iterator[U] {
-  
+
   private var gotNext = false
   private var nextValue: U = _
   private var closed = false
@@ -34,7 +34,7 @@ private[spark] abstract class NextIterator[U] extends Iterator[U] {
    * This convention is required because `null` may be a valid value,
    * and using `Option` seems like it might create unnecessary Some/None
    * instances, given some iterators might be called in a tight loop.
-   * 
+   *
    * @return U, or set 'finished' when done
    */
   protected def getNext(): U
@@ -50,7 +50,7 @@ private[spark] abstract class NextIterator[U] extends Iterator[U] {
    * Ideally you should have another try/catch, as in HadoopRDD, that
    * ensures any resources are closed should iteration fail.
    */
-  protected def close()
+  protected def close(): Unit
 
   /**
    * Calls the subclass-defined close method, but only once.
@@ -58,10 +58,12 @@ private[spark] abstract class NextIterator[U] extends Iterator[U] {
    * Usually calling `close` multiple times should be fine, but historically
    * there have been issues with some InputFormats throwing exceptions.
    */
-  def closeIfNeeded() {
+  def closeIfNeeded(): Unit = {
     if (!closed) {
-      close()
+      // Note: it's important that we set closed = true before calling close(), since setting it
+      // afterwards would permit us to call close() multiple times if close() threw an exception.
       closed = true
+      close()
     }
   }
 

@@ -17,89 +17,101 @@
 
 package org.apache.spark.deploy.master.ui
 
-import javax.servlet.http.HttpServletRequest
+import java.net.{InetAddress, NetworkInterface, SocketException}
+import java.util.Locale
+import javax.servlet.http.{HttpServlet, HttpServletRequest, HttpServletResponse}
 
-import org.eclipse.jetty.servlet.ServletContextHandler
-
-import org.apache.spark.Logging
+import org.apache.spark.deploy.DeployMessages.{DecommissionWorkersOnHosts, MasterStateResponse, RequestMasterState}
 import org.apache.spark.deploy.master.Master
-import org.apache.spark.ui.{ServerInfo, SparkUI}
+import org.apache.spark.internal.Logging
+import org.apache.spark.internal.config.UI.MASTER_UI_DECOMMISSION_ALLOW_MODE
+import org.apache.spark.internal.config.UI.UI_KILL_ENABLED
+import org.apache.spark.ui.{SparkUI, WebUI}
 import org.apache.spark.ui.JettyUtils._
-import org.apache.spark.util.{AkkaUtils, Utils}
 
 /**
  * Web UI server for the standalone master.
  */
-private[spark]
-class MasterWebUI(val master: Master, requestedPort: Int) extends Logging {
-  val masterActorRef = master.self
-  val timeout = AkkaUtils.askTimeout(master.conf)
+private[master]
+class MasterWebUI(
+    val master: Master,
+    requestedPort: Int)
+  extends WebUI(master.securityMgr, master.securityMgr.getSSLOptions("standalone"),
+    requestedPort, master.conf, name = "MasterUI") with Logging {
 
-  private val host = Utils.localHostName()
-  private val port = requestedPort
-  private val applicationPage = new ApplicationPage(this)
-  private val indexPage = new IndexPage(this)
-  private var serverInfo: Option[ServerInfo] = None
+  val masterEndpointRef = master.self
+  val killEnabled = master.conf.get(UI_KILL_ENABLED)
+  val decommissionAllowMode = master.conf.get(MASTER_UI_DECOMMISSION_ALLOW_MODE)
 
-  private val handlers: Seq[ServletContextHandler] = {
-    master.masterMetricsSystem.getServletHandlers ++
-    master.applicationMetricsSystem.getServletHandlers ++
-    Seq[ServletContextHandler](
-      createStaticHandler(MasterWebUI.STATIC_RESOURCE_DIR, "/static"),
-      createServletHandler("/app/json",
-        (request: HttpServletRequest) => applicationPage.renderJson(request), master.securityMgr),
-      createServletHandler("/app",
-        (request: HttpServletRequest) => applicationPage.render(request), master.securityMgr),
-      createServletHandler("/json",
-        (request: HttpServletRequest) => indexPage.renderJson(request), master.securityMgr),
-      createServletHandler("/",
-        (request: HttpServletRequest) => indexPage.render(request), master.securityMgr)
-    )
+  initialize()
+
+  /** Initialize all components of the server. */
+  def initialize(): Unit = {
+    val masterPage = new MasterPage(this)
+    attachPage(new ApplicationPage(this))
+    attachPage(masterPage)
+    addStaticHandler(MasterWebUI.STATIC_RESOURCE_DIR)
+    attachHandler(createRedirectHandler(
+      "/app/kill", "/", masterPage.handleAppKillRequest, httpMethods = Set("POST")))
+    attachHandler(createRedirectHandler(
+      "/driver/kill", "/", masterPage.handleDriverKillRequest, httpMethods = Set("POST")))
+    attachHandler(createServletHandler("/workers/kill", new HttpServlet {
+      override def doPost(req: HttpServletRequest, resp: HttpServletResponse): Unit = {
+        val hostnames: Seq[String] = Option(req.getParameterValues("host"))
+          .getOrElse(Array[String]()).toSeq
+        if (!isDecommissioningRequestAllowed(req)) {
+          resp.sendError(HttpServletResponse.SC_METHOD_NOT_ALLOWED)
+        } else {
+          val removedWorkers = masterEndpointRef.askSync[Integer](
+            DecommissionWorkersOnHosts(hostnames))
+          logInfo(s"Decommissioning of hosts $hostnames decommissioned $removedWorkers workers")
+          if (removedWorkers > 0) {
+            resp.setStatus(HttpServletResponse.SC_OK)
+          } else if (removedWorkers == 0) {
+            resp.sendError(HttpServletResponse.SC_NOT_FOUND)
+          } else {
+            // We shouldn't even see this case.
+            resp.setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR)
+          }
+        }
+      }
+    }, ""))
   }
 
-  def bind() {
+  def addProxy(): Unit = {
+    val handler = createProxyHandler(idToUiAddress)
+    attachHandler(handler)
+  }
+
+  def idToUiAddress(id: String): Option[String] = {
+    val state = masterEndpointRef.askSync[MasterStateResponse](RequestMasterState)
+    val maybeWorkerUiAddress = state.workers.find(_.id == id).map(_.webUiAddress)
+    val maybeAppUiAddress = state.activeApps.find(_.id == id).map(_.desc.appUiUrl)
+
+    maybeWorkerUiAddress.orElse(maybeAppUiAddress)
+  }
+
+  private def isLocal(address: InetAddress): Boolean = {
+    if (address.isAnyLocalAddress || address.isLoopbackAddress) {
+      return true
+    }
     try {
-      serverInfo = Some(startJettyServer(host, port, handlers, master.conf))
-      logInfo("Started Master web UI at http://%s:%d".format(host, boundPort))
+      NetworkInterface.getByInetAddress(address) != null
     } catch {
-      case e: Exception =>
-        logError("Failed to create Master JettyUtils", e)
-        System.exit(1)
+      case _: SocketException => false
     }
   }
 
-  def boundPort: Int = serverInfo.map(_.boundPort).getOrElse(-1)
-
-  /** Attach a reconstructed UI to this Master UI. Only valid after bind(). */
-  def attachUI(ui: SparkUI) {
-    assert(serverInfo.isDefined, "Master UI must be bound to a server before attaching SparkUIs")
-    val rootHandler = serverInfo.get.rootHandler
-    for (handler <- ui.handlers) {
-      rootHandler.addHandler(handler)
-      if (!handler.isStarted) {
-        handler.start()
-      }
+  private def isDecommissioningRequestAllowed(req: HttpServletRequest): Boolean = {
+    decommissionAllowMode match {
+      case "ALLOW" => true
+      case "LOCAL" => isLocal(InetAddress.getByName(req.getRemoteAddr))
+      case _ => false
     }
   }
 
-  /** Detach a reconstructed UI from this Master UI. Only valid after bind(). */
-  def detachUI(ui: SparkUI) {
-    assert(serverInfo.isDefined, "Master UI must be bound to a server before detaching SparkUIs")
-    val rootHandler = serverInfo.get.rootHandler
-    for (handler <- ui.handlers) {
-      if (handler.isStarted) {
-        handler.stop()
-      }
-      rootHandler.removeHandler(handler)
-    }
-  }
-
-  def stop() {
-    assert(serverInfo.isDefined, "Attempted to stop a Master UI that was not bound to a server!")
-    serverInfo.get.server.stop()
-  }
 }
 
-private[spark] object MasterWebUI {
-  val STATIC_RESOURCE_DIR = SparkUI.STATIC_RESOURCE_DIR
+private[master] object MasterWebUI {
+  private val STATIC_RESOURCE_DIR = SparkUI.STATIC_RESOURCE_DIR
 }

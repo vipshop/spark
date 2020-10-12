@@ -15,73 +15,133 @@
  * limitations under the License.
  */
 
-package org.apache.spark.sql
-package catalyst
-package plans
-package logical
+package org.apache.spark.sql.catalyst.plans.logical
 
-import org.apache.spark.sql.catalyst.errors.TreeNodeException
+import org.apache.spark.internal.Logging
+import org.apache.spark.sql.AnalysisException
+import org.apache.spark.sql.catalyst.analysis._
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.types.StructType
+import org.apache.spark.sql.catalyst.plans.QueryPlan
+import org.apache.spark.sql.catalyst.plans.logical.statsEstimation.LogicalPlanStats
+import org.apache.spark.sql.types.StructType
 
-abstract class LogicalPlan extends QueryPlan[LogicalPlan] {
-  self: Product =>
+
+abstract class LogicalPlan
+  extends QueryPlan[LogicalPlan]
+  with AnalysisHelper
+  with LogicalPlanStats
+  with QueryPlanConstraints
+  with Logging {
+
+  /** Returns true if this subtree has data from a streaming data source. */
+  def isStreaming: Boolean = children.exists(_.isStreaming)
+
+  override def verboseStringWithSuffix(maxFields: Int): String = {
+    super.verboseString(maxFields) + statsCache.map(", " + _.toString).getOrElse("")
+  }
 
   /**
-   * Returns the set of attributes that are referenced by this node
-   * during evaluation.
+   * Returns the maximum number of rows that this plan may compute.
+   *
+   * Any operator that a Limit can be pushed passed should override this function (e.g., Union).
+   * Any operator that can push through a Limit should override this function (e.g., Project).
    */
-  def references: Set[Attribute]
+  def maxRows: Option[Long] = None
 
   /**
-   * Returns the set of attributes that this node takes as
-   * input from its children.
+   * Returns the maximum number of rows this plan may compute on each partition.
    */
-  lazy val inputSet: Set[Attribute] = children.flatMap(_.output).toSet
+  def maxRowsPerPartition: Option[Long] = maxRows
 
   /**
    * Returns true if this expression and all its children have been resolved to a specific schema
-   * and false if it is still contains any unresolved placeholders. Implementations of LogicalPlan
-   * can override this (e.g. [[catalyst.analysis.UnresolvedRelation UnresolvedRelation]] should
-   * return `false`).
+   * and false if it still contains any unresolved placeholders. Implementations of LogicalPlan
+   * can override this (e.g.
+   * [[org.apache.spark.sql.catalyst.analysis.UnresolvedRelation UnresolvedRelation]]
+   * should return `false`).
    */
-  lazy val resolved: Boolean = !expressions.exists(!_.resolved) && childrenResolved
+  lazy val resolved: Boolean = expressions.forall(_.resolved) && childrenResolved
+
+  override protected def statePrefix = if (!resolved) "'" else super.statePrefix
 
   /**
    * Returns true if all its children of this query plan have been resolved.
    */
-  def childrenResolved = !children.exists(!_.resolved)
+  def childrenResolved: Boolean = children.forall(_.resolved)
 
   /**
-   * Optionally resolves the given string to a
-   * [[catalyst.expressions.NamedExpression NamedExpression]]. The attribute is expressed as
-   * as string in the following form: `[scope].AttributeName.[nested].[fields]...`.
+   * Resolves a given schema to concrete [[Attribute]] references in this query plan. This function
+   * should only be called on analyzed plans since it will throw [[AnalysisException]] for
+   * unresolved [[Attribute]]s.
    */
-  def resolve(name: String): Option[NamedExpression] = {
-    val parts = name.split("\\.")
-    // Collect all attributes that are output by this nodes children where either the first part
-    // matches the name or where the first part matches the scope and the second part matches the
-    // name.  Return these matches along with any remaining parts, which represent dotted access to
-    // struct fields.
-    val options = children.flatMap(_.output).flatMap { option =>
-      // If the first part of the desired name matches a qualifier for this possible match, drop it.
-      val remainingParts = if (option.qualifiers contains parts.head) parts.drop(1) else parts
-      if (option.name == remainingParts.head) (option, remainingParts.tail.toList) :: Nil else Nil
+  def resolve(schema: StructType, resolver: Resolver): Seq[Attribute] = {
+    schema.map { field =>
+      resolve(field.name :: Nil, resolver).map {
+        case a: AttributeReference => a
+        case _ => sys.error(s"can not handle nested schema yet...  plan $this")
+      }.getOrElse {
+        throw new AnalysisException(
+          s"Unable to resolve ${field.name} given [${output.map(_.name).mkString(", ")}]")
+      }
     }
+  }
 
-    options.distinct match {
-      case (a, Nil) :: Nil => Some(a) // One match, no nested fields, use it.
-      // One match, but we also need to extract the requested nested field.
-      case (a, nestedFields) :: Nil =>
-        a.dataType match {
-          case StructType(fields) =>
-            Some(Alias(nestedFields.foldLeft(a: Expression)(GetField), nestedFields.last)())
-          case _ => None // Don't know how to resolve these field references
-        }
-      case Nil => None         // No matches.
-      case ambiguousReferences =>
-        throw new TreeNodeException(
-          this, s"Ambiguous references to $name: ${ambiguousReferences.mkString(",")}")
+  private[this] lazy val childAttributes = AttributeSeq(children.flatMap(_.output))
+
+  private[this] lazy val outputAttributes = AttributeSeq(output)
+
+  /**
+   * Optionally resolves the given strings to a [[NamedExpression]] using the input from all child
+   * nodes of this LogicalPlan. The attribute is expressed as
+   * string in the following form: `[scope].AttributeName.[nested].[fields]...`.
+   */
+  def resolveChildren(
+      nameParts: Seq[String],
+      resolver: Resolver): Option[NamedExpression] =
+    childAttributes.resolve(nameParts, resolver)
+
+  /**
+   * Optionally resolves the given strings to a [[NamedExpression]] based on the output of this
+   * LogicalPlan. The attribute is expressed as string in the following form:
+   * `[scope].AttributeName.[nested].[fields]...`.
+   */
+  def resolve(
+      nameParts: Seq[String],
+      resolver: Resolver): Option[NamedExpression] =
+    outputAttributes.resolve(nameParts, resolver)
+
+  /**
+   * Given an attribute name, split it to name parts by dot, but
+   * don't split the name parts quoted by backticks, for example,
+   * `ab.cd`.`efg` should be split into two parts "ab.cd" and "efg".
+   */
+  def resolveQuoted(
+      name: String,
+      resolver: Resolver): Option[NamedExpression] = {
+    outputAttributes.resolve(UnresolvedAttribute.parseAttributeName(name), resolver)
+  }
+
+  /**
+   * Refreshes (or invalidates) any metadata/data cached in the plan recursively.
+   */
+  def refresh(): Unit = children.foreach(_.refresh())
+
+  /**
+   * Returns the output ordering that this plan generates.
+   */
+  def outputOrdering: Seq[SortOrder] = Nil
+
+  /**
+   * Returns true iff `other`'s output is semantically the same, ie.:
+   *  - it contains the same number of `Attribute`s;
+   *  - references are the same;
+   *  - the order is equal too.
+   */
+  def sameOutput(other: LogicalPlan): Boolean = {
+    val thisOutput = this.output
+    val otherOutput = other.output
+    thisOutput.length == otherOutput.length && thisOutput.zip(otherOutput).forall {
+      case (a1, a2) => a1.semanticEquals(a2)
     }
   }
 }
@@ -89,44 +149,127 @@ abstract class LogicalPlan extends QueryPlan[LogicalPlan] {
 /**
  * A logical plan node with no children.
  */
-abstract class LeafNode extends LogicalPlan with trees.LeafNode[LogicalPlan] {
-  self: Product =>
+abstract class LeafNode extends LogicalPlan {
+  override final def children: Seq[LogicalPlan] = Nil
+  override def producedAttributes: AttributeSet = outputSet
 
-  // Leaf nodes by definition cannot reference any input attributes.
-  def references = Set.empty
+  /** Leaf nodes that can survive analysis must define their own statistics. */
+  def computeStats(): Statistics = throw new UnsupportedOperationException
 }
-
-/**
- * A logical node that represents a non-query command to be executed by the system.  For example,
- * commands can be used by parsers to represent DDL operations.
- */
-abstract class Command extends LeafNode {
-  self: Product =>
-  def output = Seq.empty
-}
-
-/**
- * Returned for commands supported by a given parser, but not catalyst.  In general these are DDL
- * commands that are passed directly to another system.
- */
-case class NativeCommand(cmd: String) extends Command
-
-/**
- * Returned by a parser when the users only wants to see what query plan would be executed, without
- * actually performing the execution.
- */
-case class ExplainCommand(plan: LogicalPlan) extends Command
 
 /**
  * A logical plan node with single child.
  */
-abstract class UnaryNode extends LogicalPlan with trees.UnaryNode[LogicalPlan] {
-  self: Product =>
+abstract class UnaryNode extends LogicalPlan {
+  def child: LogicalPlan
+
+  override final def children: Seq[LogicalPlan] = child :: Nil
+
+  /**
+   * Generates all valid constraints including an set of aliased constraints by replacing the
+   * original constraint expressions with the corresponding alias
+   */
+  protected def getAllValidConstraints(projectList: Seq[NamedExpression]): ExpressionSet = {
+    var allConstraints = child.constraints
+    projectList.foreach {
+      case a @ Alias(l: Literal, _) =>
+        allConstraints += EqualNullSafe(a.toAttribute, l)
+      case a @ Alias(e, _) =>
+        // For every alias in `projectList`, replace the reference in constraints by its attribute.
+        allConstraints ++= allConstraints.map(_ transform {
+          case expr: Expression if expr.semanticEquals(e) =>
+            a.toAttribute
+        })
+        allConstraints += EqualNullSafe(e, a.toAttribute)
+      case _ => // Don't change.
+    }
+
+    allConstraints
+  }
+
+  override protected lazy val validConstraints: ExpressionSet = child.constraints
 }
 
 /**
  * A logical plan node with a left and right child.
  */
-abstract class BinaryNode extends LogicalPlan with trees.BinaryNode[LogicalPlan] {
-  self: Product =>
+abstract class BinaryNode extends LogicalPlan {
+  def left: LogicalPlan
+  def right: LogicalPlan
+
+  override final def children: Seq[LogicalPlan] = Seq(left, right)
+}
+
+abstract class OrderPreservingUnaryNode extends UnaryNode {
+  override final def outputOrdering: Seq[SortOrder] = child.outputOrdering
+}
+
+object LogicalPlanIntegrity {
+
+  private def canGetOutputAttrs(p: LogicalPlan): Boolean = {
+    p.resolved && !p.expressions.exists { e =>
+      e.collectFirst {
+        // We cannot call `output` in plans with a `ScalarSubquery` expr having no column,
+        // so, we filter out them in advance.
+        case s: ScalarSubquery if s.plan.schema.fields.isEmpty => true
+      }.isDefined
+    }
+  }
+
+  /**
+   * Since some logical plans (e.g., `Union`) can build `AttributeReference`s in their `output`,
+   * this method checks if the same `ExprId` refers to attributes having the same data type
+   * in plan output.
+   */
+  def hasUniqueExprIdsForOutput(plan: LogicalPlan): Boolean = {
+    val exprIds = plan.collect { case p if canGetOutputAttrs(p) =>
+      // NOTE: we still need to filter resolved expressions here because the output of
+      // some resolved logical plans can have unresolved references,
+      // e.g., outer references in `ExistenceJoin`.
+      p.output.filter(_.resolved).map { a => (a.exprId, a.dataType) }
+    }.flatten
+
+    val ignoredExprIds = plan.collect {
+      // NOTE: `Union` currently reuses input `ExprId`s for output references, but we cannot
+      // simply modify the code for assigning new `ExprId`s in `Union#output` because
+      // the modification will make breaking changes (See SPARK-32741(#29585)).
+      // So, this check just ignores the `exprId`s of `Union` output.
+      case u: Union if u.resolved => u.output.map(_.exprId)
+    }.flatten.toSet
+
+    val groupedDataTypesByExprId = exprIds.filterNot { case (exprId, _) =>
+      ignoredExprIds.contains(exprId)
+    }.groupBy(_._1).values.map(_.distinct)
+
+    groupedDataTypesByExprId.forall(_.length == 1)
+  }
+
+  /**
+   * This method checks if reference `ExprId`s are not reused when assigning a new `ExprId`.
+   * For example, it returns false if plan transformers create an alias having the same `ExprId`
+   * with one of reference attributes, e.g., `a#1 + 1 AS a#1`.
+   */
+  def checkIfSameExprIdNotReused(plan: LogicalPlan): Boolean = {
+    plan.collect { case p if p.resolved =>
+      p.expressions.forall {
+        case a: Alias =>
+          // Even if a plan is resolved, `a.references` can return unresolved references,
+          // e.g., in `Grouping`/`GroupingID`, so we need to filter out them and
+          // check if the same `exprId` in `Alias` does not exist
+          // among reference `exprId`s.
+          !a.references.filter(_.resolved).map(_.exprId).exists(_ == a.exprId)
+        case _ =>
+          true
+      }
+    }.forall(identity)
+  }
+
+  /**
+   * This method checks if the same `ExprId` refers to an unique attribute in a plan tree.
+   * Some plan transformers (e.g., `RemoveNoopOperators`) rewrite logical
+   * plans based on this assumption.
+   */
+  def checkIfExprIdsAreGloballyUnique(plan: LogicalPlan): Boolean = {
+    checkIfSameExprIdNotReused(plan) && hasUniqueExprIdsForOutput(plan)
+  }
 }

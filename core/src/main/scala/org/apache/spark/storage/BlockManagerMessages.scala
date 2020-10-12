@@ -19,36 +19,54 @@ package org.apache.spark.storage
 
 import java.io.{Externalizable, ObjectInput, ObjectOutput}
 
-import akka.actor.ActorRef
+import org.apache.spark.rpc.RpcEndpointRef
+import org.apache.spark.util.Utils
 
-private[storage] object BlockManagerMessages {
+private[spark] object BlockManagerMessages {
   //////////////////////////////////////////////////////////////////////////////////
-  // Messages from the master to slaves.
+  // Messages from the master to storage endpoints.
   //////////////////////////////////////////////////////////////////////////////////
-  sealed trait ToBlockManagerSlave
+  sealed trait ToBlockManagerMasterStorageEndpoint
 
-  // Remove a block from the slaves that have it. This can only be used to remove
+  // Remove a block from the storage endpoints that have it. This can only be used to remove
   // blocks that the master knows about.
-  case class RemoveBlock(blockId: BlockId) extends ToBlockManagerSlave
+  case class RemoveBlock(blockId: BlockId) extends ToBlockManagerMasterStorageEndpoint
+
+  // Replicate blocks that were lost due to executor failure
+  case class ReplicateBlock(blockId: BlockId, replicas: Seq[BlockManagerId], maxReplicas: Int)
+    extends ToBlockManagerMasterStorageEndpoint
+
+  case object DecommissionBlockManager extends ToBlockManagerMasterStorageEndpoint
 
   // Remove all blocks belonging to a specific RDD.
-  case class RemoveRdd(rddId: Int) extends ToBlockManagerSlave
+  case class RemoveRdd(rddId: Int) extends ToBlockManagerMasterStorageEndpoint
 
+  // Remove all blocks belonging to a specific shuffle.
+  case class RemoveShuffle(shuffleId: Int) extends ToBlockManagerMasterStorageEndpoint
+
+  // Remove all blocks belonging to a specific broadcast.
+  case class RemoveBroadcast(broadcastId: Long, removeFromDriver: Boolean = true)
+    extends ToBlockManagerMasterStorageEndpoint
+
+  /**
+   * Driver to Executor message to trigger a thread dump.
+   */
+  case object TriggerThreadDump extends ToBlockManagerMasterStorageEndpoint
 
   //////////////////////////////////////////////////////////////////////////////////
-  // Messages from slaves to the master.
+  // Messages from storage endpoints to the master.
   //////////////////////////////////////////////////////////////////////////////////
   sealed trait ToBlockManagerMaster
 
   case class RegisterBlockManager(
       blockManagerId: BlockManagerId,
-      maxMemSize: Long,
-      sender: ActorRef)
+      localDirs: Array[String],
+      maxOnHeapMemSize: Long,
+      maxOffHeapMemSize: Long,
+      sender: RpcEndpointRef)
     extends ToBlockManagerMaster
 
-  case class HeartBeat(blockManagerId: BlockManagerId) extends ToBlockManagerMaster
-
-  class UpdateBlockInfo(
+  case class UpdateBlockInfo(
       var blockManagerId: BlockManagerId,
       var blockId: BlockId,
       var storageLevel: StorageLevel,
@@ -59,7 +77,7 @@ private[storage] object BlockManagerMessages {
 
     def this() = this(null, null, null, 0, 0)  // For deserialization only
 
-    override def writeExternal(out: ObjectOutput) {
+    override def writeExternal(out: ObjectOutput): Unit = Utils.tryOrIOException {
       blockManagerId.writeExternal(out)
       out.writeUTF(blockId.name)
       storageLevel.writeExternal(out)
@@ -67,7 +85,7 @@ private[storage] object BlockManagerMessages {
       out.writeLong(diskSize)
     }
 
-    override def readExternal(in: ObjectInput) {
+    override def readExternal(in: ObjectInput): Unit = Utils.tryOrIOException {
       blockManagerId = BlockManagerId(in)
       blockId = BlockId(in.readUTF())
       storageLevel = StorageLevel(in)
@@ -76,26 +94,30 @@ private[storage] object BlockManagerMessages {
     }
   }
 
-  object UpdateBlockInfo {
-    def apply(blockManagerId: BlockManagerId,
-        blockId: BlockId,
-        storageLevel: StorageLevel,
-        memSize: Long,
-        diskSize: Long): UpdateBlockInfo = {
-      new UpdateBlockInfo(blockManagerId, blockId, storageLevel, memSize, diskSize)
-    }
-
-    // For pattern-matching
-    def unapply(h: UpdateBlockInfo): Option[(BlockManagerId, BlockId, StorageLevel, Long, Long)] = {
-      Some((h.blockManagerId, h.blockId, h.storageLevel, h.memSize, h.diskSize))
-    }
-  }
-
   case class GetLocations(blockId: BlockId) extends ToBlockManagerMaster
+
+  case class GetLocationsAndStatus(blockId: BlockId, requesterHost: String)
+    extends ToBlockManagerMaster
+
+  /**
+   * The response message of `GetLocationsAndStatus` request.
+   *
+   * @param localDirs if it is persisted-to-disk on the same host as the requester executor is
+   *                  running on then localDirs will be Some and the cached data will be in a file
+   *                  in one of those dirs, otherwise it is None.
+   */
+  case class BlockLocationsAndStatus(
+      locations: Seq[BlockManagerId],
+      status: BlockStatus,
+      localDirs: Option[Array[String]]) {
+    assert(locations.nonEmpty)
+  }
 
   case class GetLocationsMultipleBlockIds(blockIds: Array[BlockId]) extends ToBlockManagerMaster
 
-  case class GetPeers(blockManagerId: BlockManagerId, size: Int) extends ToBlockManagerMaster
+  case class GetPeers(blockManagerId: BlockManagerId) extends ToBlockManagerMaster
+
+  case class GetExecutorEndpointRef(executorId: String) extends ToBlockManagerMaster
 
   case class RemoveExecutor(execId: String) extends ToBlockManagerMaster
 
@@ -103,7 +125,20 @@ private[storage] object BlockManagerMessages {
 
   case object GetMemoryStatus extends ToBlockManagerMaster
 
-  case object ExpireDeadHosts extends ToBlockManagerMaster
-
   case object GetStorageStatus extends ToBlockManagerMaster
+
+  case class DecommissionBlockManagers(executorIds: Seq[String]) extends ToBlockManagerMaster
+
+  case class GetReplicateInfoForRDDBlocks(blockManagerId: BlockManagerId)
+    extends ToBlockManagerMaster
+
+  case class GetBlockStatus(blockId: BlockId, askStorageEndpoints: Boolean = true)
+    extends ToBlockManagerMaster
+
+  case class GetMatchingBlockIds(filter: BlockId => Boolean, askStorageEndpoints: Boolean = true)
+    extends ToBlockManagerMaster
+
+  case class BlockManagerHeartbeat(blockManagerId: BlockManagerId) extends ToBlockManagerMaster
+
+  case class IsExecutorAlive(executorId: String) extends ToBlockManagerMaster
 }

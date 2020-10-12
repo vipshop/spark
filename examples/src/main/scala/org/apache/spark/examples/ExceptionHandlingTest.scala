@@ -17,23 +17,21 @@
 
 package org.apache.spark.examples
 
-import org.apache.spark.SparkContext
+import org.apache.spark.sql.SparkSession
 
 object ExceptionHandlingTest {
-  def main(args: Array[String]) {
-    if (args.length == 0) {
-      System.err.println("Usage: ExceptionHandlingTest <master>")
-      System.exit(1)
-    }
+  def main(args: Array[String]): Unit = {
+    val spark = SparkSession
+      .builder
+      .appName("ExceptionHandlingTest")
+      .getOrCreate()
 
-    val sc = new SparkContext(args(0), "ExceptionHandlingTest",
-      System.getenv("SPARK_HOME"), SparkContext.jarOfClass(this.getClass))
-    sc.parallelize(0 until sc.defaultParallelism).foreach { i =>
+    spark.sparkContext.parallelize(0 until spark.sparkContext.defaultParallelism).foreach { i =>
       if (math.random > 0.75) {
         throw new Exception("Testing exception handling")
       }
     }
 
-    System.exit(0)
+    spark.stop()
   }
 }

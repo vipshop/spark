@@ -17,10 +17,14 @@
 
 package org.apache.spark.util.random
 
+import org.apache.spark.annotation.DeveloperApi
+
 /**
+ * :: DeveloperApi ::
  * A class with pseudorandom behavior.
  */
+@DeveloperApi
 trait Pseudorandom {
   /** Set random seed. */
-  def setSeed(seed: Long)
+  def setSeed(seed: Long): Unit
 }

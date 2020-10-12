@@ -19,14 +19,18 @@ package org.apache.spark.util.collection
 
 import scala.reflect._
 
+import com.google.common.hash.Hashing
+
+import org.apache.spark.annotation.Private
+
 /**
  * A simple, fast hash set optimized for non-null insertion-only use case, where keys are never
  * removed.
  *
  * The underlying implementation uses Scala compiler's specialization to generate optimized
- * storage for two primitive types (Long and Int). It is much faster than Java's standard HashSet
- * while incurring much less memory overhead. This can serve as building blocks for higher level
- * data structures such as an optimized HashMap.
+ * storage for four primitive types (Long, Int, Double, and Float). It is much faster than Java's
+ * standard HashSet while incurring much less memory overhead. This can serve as building blocks
+ * for higher level data structures such as an optimized HashMap.
  *
  * This OpenHashSet is designed to serve as building blocks for higher level data structures
  * such as an optimized hash map. Compared with standard hash set implementations, this class
@@ -36,14 +40,15 @@ import scala.reflect._
  * It uses quadratic probing with a power-of-2 hash table size, which is guaranteed
  * to explore all spaces for each key (see http://en.wikipedia.org/wiki/Quadratic_probing).
  */
-private[spark]
-class OpenHashSet[@specialized(Long, Int) T: ClassTag](
+@Private
+class OpenHashSet[@specialized(Long, Int, Double, Float) T: ClassTag](
     initialCapacity: Int,
     loadFactor: Double)
   extends Serializable {
 
-  require(initialCapacity <= (1 << 29), "Can't make capacity bigger than 2^29 elements")
-  require(initialCapacity >= 1, "Invalid initial capacity")
+  require(initialCapacity <= OpenHashSet.MAX_CAPACITY,
+    s"Can't make capacity bigger than ${OpenHashSet.MAX_CAPACITY} elements")
+  require(initialCapacity >= 0, "Invalid initial capacity")
   require(loadFactor < 1.0, "Load factor must be less than 1.0")
   require(loadFactor > 0.0, "Load factor must be greater than 0.0")
 
@@ -72,6 +77,10 @@ class OpenHashSet[@specialized(Long, Int) T: ClassTag](
       (new LongHasher).asInstanceOf[Hasher[T]]
     } else if (mt == ClassTag.Int) {
       (new IntHasher).asInstanceOf[Hasher[T]]
+    } else if (mt == ClassTag.Double) {
+      (new DoubleHasher).asInstanceOf[Hasher[T]]
+    } else if (mt == ClassTag.Float) {
+      (new FloatHasher).asInstanceOf[Hasher[T]]
     } else {
       new Hasher[T]
     }
@@ -84,7 +93,7 @@ class OpenHashSet[@specialized(Long, Int) T: ClassTag](
 
   protected var _bitset = new BitSet(_capacity)
 
-  def getBitSet = _bitset
+  def getBitSet: BitSet = _bitset
 
   // Init of the array in constructor (instead of in declaration) to work around a Scala compiler
   // specialization bug that would generate two arrays (one for Object and one for specialized T).
@@ -104,9 +113,17 @@ class OpenHashSet[@specialized(Long, Int) T: ClassTag](
    * Add an element to the set. If the set is over capacity after the insertion, grow the set
    * and rehash all elements.
    */
-  def add(k: T) {
+  def add(k: T): Unit = {
     addWithoutResize(k)
     rehashIfNeeded(k, grow, move)
+  }
+
+  def union(other: OpenHashSet[T]): OpenHashSet[T] = {
+    val iterator = other.iterator
+    while (iterator.hasNext) {
+      add(iterator.next())
+    }
+    this
   }
 
   /**
@@ -114,14 +131,14 @@ class OpenHashSet[@specialized(Long, Int) T: ClassTag](
    * The caller is responsible for calling rehashIfNeeded.
    *
    * Use (retval & POSITION_MASK) to get the actual position, and
-   * (retval & EXISTENCE_MASK) != 0 for prior existence.
+   * (retval & NONEXISTENCE_MASK) == 0 for prior existence.
    *
    * @return The position where the key is placed, plus the highest order bit is set if the key
-   *         exists previously.
+   *         does not exists previously.
    */
   def addWithoutResize(k: T): Int = {
     var pos = hashcode(hasher.hash(k)) & _mask
-    var i = 1
+    var delta = 1
     while (true) {
       if (!_bitset.get(pos)) {
         // This is a new key.
@@ -133,14 +150,12 @@ class OpenHashSet[@specialized(Long, Int) T: ClassTag](
         // Found an existing key.
         return pos
       } else {
-        val delta = i
+        // quadratic probing with values increase by 1, 2, 3, ...
         pos = (pos + delta) & _mask
-        i += 1
+        delta += 1
       }
     }
-    // Never reached here
-    assert(INVALID_POS != INVALID_POS)
-    INVALID_POS
+    throw new RuntimeException("Should never reach here.")
   }
 
   /**
@@ -151,7 +166,7 @@ class OpenHashSet[@specialized(Long, Int) T: ClassTag](
    * @param moveFunc Callback invoked when we move the key from one position (in the old data array)
    *                 to a new position (in the new data array).
    */
-  def rehashIfNeeded(k: T, allocateFunc: (Int) => Unit, moveFunc: (Int, Int) => Unit) {
+  def rehashIfNeeded(k: T, allocateFunc: (Int) => Unit, moveFunc: (Int, Int) => Unit): Unit = {
     if (_size > _growThreshold) {
       rehash(k, allocateFunc, moveFunc)
     }
@@ -162,27 +177,25 @@ class OpenHashSet[@specialized(Long, Int) T: ClassTag](
    */
   def getPos(k: T): Int = {
     var pos = hashcode(hasher.hash(k)) & _mask
-    var i = 1
-    val maxProbe = _data.size
-    while (i < maxProbe) {
+    var delta = 1
+    while (true) {
       if (!_bitset.get(pos)) {
         return INVALID_POS
       } else if (k == _data(pos)) {
         return pos
       } else {
-        val delta = i
+        // quadratic probing with values increase by 1, 2, 3, ...
         pos = (pos + delta) & _mask
-        i += 1
+        delta += 1
       }
     }
-    // Never reached here
-    INVALID_POS
+    throw new RuntimeException("Should never reach here.")
   }
 
   /** Return the value at the specified position. */
   def getValue(pos: Int): T = _data(pos)
 
-  def iterator = new Iterator[T] {
+  def iterator: Iterator[T] = new Iterator[T] {
     var pos = nextPos(0)
     override def hasNext: Boolean = pos != INVALID_POS
     override def next(): T = {
@@ -214,8 +227,10 @@ class OpenHashSet[@specialized(Long, Int) T: ClassTag](
    * @param moveFunc Callback invoked when we move the key from one position (in the old data array)
    *                 to a new position (in the new data array).
    */
-  private def rehash(k: T, allocateFunc: (Int) => Unit, moveFunc: (Int, Int) => Unit) {
+  private def rehash(k: T, allocateFunc: (Int) => Unit, moveFunc: (Int, Int) => Unit): Unit = {
     val newCapacity = _capacity * 2
+    require(newCapacity > 0 && newCapacity <= OpenHashSet.MAX_CAPACITY,
+      s"Can't contain more than ${(loadFactor * OpenHashSet.MAX_CAPACITY).toInt} elements")
     allocateFunc(newCapacity)
     val newBitset = new BitSet(newCapacity)
     val newData = new Array[T](newCapacity)
@@ -256,13 +271,16 @@ class OpenHashSet[@specialized(Long, Int) T: ClassTag](
 
   /**
    * Re-hash a value to deal better with hash functions that don't differ in the lower bits.
-   * We use the Murmur Hash 3 finalization step that's also used in fastutil.
    */
-  private def hashcode(h: Int): Int = it.unimi.dsi.fastutil.HashCommon.murmurHash3(h)
+  private def hashcode(h: Int): Int = Hashing.murmur3_32().hashInt(h).asInt()
 
   private def nextPowerOf2(n: Int): Int = {
-    val highBit = Integer.highestOneBit(n)
-    if (highBit == n) n else highBit << 1
+    if (n == 0) {
+      1
+    } else {
+      val highBit = Integer.highestOneBit(n)
+      if (highBit == n) n else highBit << 1
+    }
   }
 }
 
@@ -270,15 +288,16 @@ class OpenHashSet[@specialized(Long, Int) T: ClassTag](
 private[spark]
 object OpenHashSet {
 
+  val MAX_CAPACITY = 1 << 30
   val INVALID_POS = -1
-  val NONEXISTENCE_MASK = 0x80000000
-  val POSITION_MASK = 0xEFFFFFF
+  val NONEXISTENCE_MASK = 1 << 31
+  val POSITION_MASK = (1 << 31) - 1
 
   /**
    * A set of specialized hash function implementation to avoid boxing hash code computation
    * in the specialized implementation of OpenHashSet.
    */
-  sealed class Hasher[@specialized(Long, Int) T] extends Serializable {
+  sealed class Hasher[@specialized(Long, Int, Double, Float) T] extends Serializable {
     def hash(o: T): Int = o.hashCode()
   }
 
@@ -290,8 +309,19 @@ object OpenHashSet {
     override def hash(o: Int): Int = o
   }
 
-  private def grow1(newSize: Int) {}
-  private def move1(oldPos: Int, newPos: Int) { }
+  class DoubleHasher extends Hasher[Double] {
+    override def hash(o: Double): Int = {
+      val bits = java.lang.Double.doubleToLongBits(o)
+      (bits ^ (bits >>> 32)).toInt
+    }
+  }
+
+  class FloatHasher extends Hasher[Float] {
+    override def hash(o: Float): Int = java.lang.Float.floatToIntBits(o)
+  }
+
+  private def grow1(newSize: Int): Unit = {}
+  private def move1(oldPos: Int, newPos: Int): Unit = { }
 
   private val grow = grow1 _
   private val move = move1 _

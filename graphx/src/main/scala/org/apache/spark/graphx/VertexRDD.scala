@@ -20,18 +20,21 @@ package org.apache.spark.graphx
 import scala.reflect.ClassTag
 
 import org.apache.spark._
-import org.apache.spark.SparkContext._
+import org.apache.spark.graphx.impl.RoutingTablePartition
+import org.apache.spark.graphx.impl.ShippableVertexPartition
+import org.apache.spark.graphx.impl.VertexAttributeBlock
+import org.apache.spark.graphx.impl.VertexRDDImpl
 import org.apache.spark.rdd._
 import org.apache.spark.storage.StorageLevel
-
-import org.apache.spark.graphx.impl.MsgRDDFunctions
-import org.apache.spark.graphx.impl.VertexPartition
 
 /**
  * Extends `RDD[(VertexId, VD)]` by ensuring that there is only one entry for each vertex and by
  * pre-indexing the entries for fast, efficient joins. Two VertexRDDs with the same index can be
  * joined efficiently. All operations except [[reindex]] preserve the index. To construct a
  * `VertexRDD`, use the [[org.apache.spark.graphx.VertexRDD$ VertexRDD object]].
+ *
+ * Additionally, stores routing information to enable joining the vertex attributes with an
+ * [[EdgeRDD]].
  *
  * @example Construct a `VertexRDD` from a plain RDD:
  * {{{
@@ -49,71 +52,44 @@ import org.apache.spark.graphx.impl.VertexPartition
  *
  * @tparam VD the vertex attribute associated with each vertex in the set.
  */
-class VertexRDD[@specialized VD: ClassTag](
-    val partitionsRDD: RDD[VertexPartition[VD]])
-  extends RDD[(VertexId, VD)](partitionsRDD.context, List(new OneToOneDependency(partitionsRDD))) {
+abstract class VertexRDD[VD](
+    sc: SparkContext,
+    deps: Seq[Dependency[_]]) extends RDD[(VertexId, VD)](sc, deps) {
 
-  require(partitionsRDD.partitioner.isDefined)
+  implicit protected def vdTag: ClassTag[VD]
 
-  partitionsRDD.setName("VertexRDD")
+  private[graphx] def partitionsRDD: RDD[ShippableVertexPartition[VD]]
+
+  override protected def getPartitions: Array[Partition] = partitionsRDD.partitions
+
+  /**
+   * Provides the `RDD[(VertexId, VD)]` equivalent output.
+   */
+  override def compute(part: Partition, context: TaskContext): Iterator[(VertexId, VD)] = {
+    firstParent[ShippableVertexPartition[VD]].iterator(part, context).next().iterator
+  }
 
   /**
    * Construct a new VertexRDD that is indexed by only the visible vertices. The resulting
    * VertexRDD will be based on a different index and can no longer be quickly joined with this
    * RDD.
    */
-  def reindex(): VertexRDD[VD] = new VertexRDD(partitionsRDD.map(_.reindex()))
-
-  override val partitioner = partitionsRDD.partitioner
-
-  override protected def getPartitions: Array[Partition] = partitionsRDD.partitions
-
-  override protected def getPreferredLocations(s: Partition): Seq[String] =
-    partitionsRDD.preferredLocations(s)
-
-  override def persist(newLevel: StorageLevel): VertexRDD[VD] = {
-    partitionsRDD.persist(newLevel)
-    this
-  }
-
-  /** Persist this RDD with the default storage level (`MEMORY_ONLY`). */
-  override def persist(): VertexRDD[VD] = persist(StorageLevel.MEMORY_ONLY)
-
-  /** Persist this RDD with the default storage level (`MEMORY_ONLY`). */
-  override def cache(): VertexRDD[VD] = persist()
-
-  override def unpersist(blocking: Boolean = true): VertexRDD[VD] = {
-    partitionsRDD.unpersist(blocking)
-    this
-  }
-
-  /** The number of vertices in the RDD. */
-  override def count(): Long = {
-    partitionsRDD.map(_.size).reduce(_ + _)
-  }
-
-  /**
-   * Provides the `RDD[(VertexId, VD)]` equivalent output.
-   */
-  override def compute(part: Partition, context: TaskContext): Iterator[(VertexId, VD)] = {
-    firstParent[VertexPartition[VD]].iterator(part, context).next.iterator
-  }
+  def reindex(): VertexRDD[VD]
 
   /**
    * Applies a function to each `VertexPartition` of this RDD and returns a new VertexRDD.
    */
   private[graphx] def mapVertexPartitions[VD2: ClassTag](
-    f: VertexPartition[VD] => VertexPartition[VD2])
-    : VertexRDD[VD2] = {
-    val newPartitionsRDD = partitionsRDD.mapPartitions(_.map(f), preservesPartitioning = true)
-    new VertexRDD(newPartitionsRDD)
-  }
-
+      f: ShippableVertexPartition[VD] => ShippableVertexPartition[VD2])
+    : VertexRDD[VD2]
 
   /**
    * Restricts the vertex set to the set of vertices satisfying the given predicate. This operation
    * preserves the index for efficient joins with the original RDD, and it sets bits in the bitmask
    * rather than allocating new memory.
+   *
+   * It is declared and defined here to allow refining the return type from `RDD[(VertexId, VD)]` to
+   * `VertexRDD[VD]`.
    *
    * @param pred the user defined predicate, which takes a tuple to conform to the
    * `RDD[(VertexId, VD)]` interface
@@ -130,8 +106,7 @@ class VertexRDD[@specialized VD: ClassTag](
    * @return a new VertexRDD with values obtained by applying `f` to each of the entries in the
    * original VertexRDD
    */
-  def mapValues[VD2: ClassTag](f: VD => VD2): VertexRDD[VD2] =
-    this.mapVertexPartitions(_.map((vid, attr) => f(attr)))
+  def mapValues[VD2: ClassTag](f: VD => VD2): VertexRDD[VD2]
 
   /**
    * Maps each vertex attribute, additionally supplying the vertex ID.
@@ -142,29 +117,47 @@ class VertexRDD[@specialized VD: ClassTag](
    * @return a new VertexRDD with values obtained by applying `f` to each of the entries in the
    * original VertexRDD.  The resulting VertexRDD retains the same index.
    */
-  def mapValues[VD2: ClassTag](f: (VertexId, VD) => VD2): VertexRDD[VD2] =
-    this.mapVertexPartitions(_.map(f))
+  def mapValues[VD2: ClassTag](f: (VertexId, VD) => VD2): VertexRDD[VD2]
 
   /**
-   * Hides vertices that are the same between `this` and `other`; for vertices that are different,
-   * keeps the values from `other`.
+   * For each VertexId present in both `this` and `other`, minus will act as a set difference
+   * operation returning only those unique VertexId's present in `this`.
+   *
+   * @param other an RDD to run the set operation against
    */
-  def diff(other: VertexRDD[VD]): VertexRDD[VD] = {
-    val newPartitionsRDD = partitionsRDD.zipPartitions(
-      other.partitionsRDD, preservesPartitioning = true
-    ) { (thisIter, otherIter) =>
-      val thisPart = thisIter.next()
-      val otherPart = otherIter.next()
-      Iterator(thisPart.diff(otherPart))
-    }
-    new VertexRDD(newPartitionsRDD)
-  }
+  def minus(other: RDD[(VertexId, VD)]): VertexRDD[VD]
+
+  /**
+   * For each VertexId present in both `this` and `other`, minus will act as a set difference
+   * operation returning only those unique VertexId's present in `this`.
+   *
+   * @param other a VertexRDD to run the set operation against
+   */
+  def minus(other: VertexRDD[VD]): VertexRDD[VD]
+
+  /**
+   * For each vertex present in both `this` and `other`, `diff` returns only those vertices with
+   * differing values; for values that are different, keeps the values from `other`. This is
+   * only guaranteed to work if the VertexRDDs share a common ancestor.
+   *
+   * @param other the other RDD[(VertexId, VD)] with which to diff against.
+   */
+  def diff(other: RDD[(VertexId, VD)]): VertexRDD[VD]
+
+  /**
+   * For each vertex present in both `this` and `other`, `diff` returns only those vertices with
+   * differing values; for values that are different, keeps the values from `other`. This is
+   * only guaranteed to work if the VertexRDDs share a common ancestor.
+   *
+   * @param other the other VertexRDD with which to diff against.
+   */
+  def diff(other: VertexRDD[VD]): VertexRDD[VD]
 
   /**
    * Left joins this RDD with another VertexRDD with the same index. This function will fail if
    * both VertexRDDs do not share the same index. The resulting vertex set contains an entry for
-   * each
-   * vertex in `this`. If `other` is missing any vertex in this VertexRDD, `f` is passed `None`.
+   * each vertex in `this`.
+   * If `other` is missing any vertex in this VertexRDD, `f` is passed `None`.
    *
    * @tparam VD2 the attribute type of the other VertexRDD
    * @tparam VD3 the attribute type of the resulting VertexRDD
@@ -175,16 +168,7 @@ class VertexRDD[@specialized VD: ClassTag](
    * @return a VertexRDD containing the results of `f`
    */
   def leftZipJoin[VD2: ClassTag, VD3: ClassTag]
-      (other: VertexRDD[VD2])(f: (VertexId, VD, Option[VD2]) => VD3): VertexRDD[VD3] = {
-    val newPartitionsRDD = partitionsRDD.zipPartitions(
-      other.partitionsRDD, preservesPartitioning = true
-    ) { (thisIter, otherIter) =>
-      val thisPart = thisIter.next()
-      val otherPart = otherIter.next()
-      Iterator(thisPart.leftJoin(otherPart)(f))
-    }
-    new VertexRDD(newPartitionsRDD)
-  }
+      (other: VertexRDD[VD2])(f: (VertexId, VD, Option[VD2]) => VD3): VertexRDD[VD3]
 
   /**
    * Left joins this VertexRDD with an RDD containing vertex attribute pairs. If the other RDD is
@@ -205,39 +189,14 @@ class VertexRDD[@specialized VD: ClassTag](
   def leftJoin[VD2: ClassTag, VD3: ClassTag]
       (other: RDD[(VertexId, VD2)])
       (f: (VertexId, VD, Option[VD2]) => VD3)
-    : VertexRDD[VD3] = {
-    // Test if the other vertex is a VertexRDD to choose the optimal join strategy.
-    // If the other set is a VertexRDD then we use the much more efficient leftZipJoin
-    other match {
-      case other: VertexRDD[_] =>
-        leftZipJoin(other)(f)
-      case _ =>
-        new VertexRDD[VD3](
-          partitionsRDD.zipPartitions(
-            other.partitionBy(this.partitioner.get), preservesPartitioning = true)
-          { (part, msgs) =>
-            val vertexPartition: VertexPartition[VD] = part.next()
-            Iterator(vertexPartition.leftJoin(msgs)(f))
-          }
-        )
-    }
-  }
+    : VertexRDD[VD3]
 
   /**
    * Efficiently inner joins this VertexRDD with another VertexRDD sharing the same index. See
    * [[innerJoin]] for the behavior of the join.
    */
   def innerZipJoin[U: ClassTag, VD2: ClassTag](other: VertexRDD[U])
-      (f: (VertexId, VD, U) => VD2): VertexRDD[VD2] = {
-    val newPartitionsRDD = partitionsRDD.zipPartitions(
-      other.partitionsRDD, preservesPartitioning = true
-    ) { (thisIter, otherIter) =>
-      val thisPart = thisIter.next()
-      val otherPart = otherIter.next()
-      Iterator(thisPart.innerJoin(otherPart)(f))
-    }
-    new VertexRDD(newPartitionsRDD)
-  }
+      (f: (VertexId, VD, U) => VD2): VertexRDD[VD2]
 
   /**
    * Inner joins this VertexRDD with an RDD containing vertex attribute pairs. If the other RDD is
@@ -251,23 +210,7 @@ class VertexRDD[@specialized VD: ClassTag](
    *         `this` and `other`, with values supplied by `f`
    */
   def innerJoin[U: ClassTag, VD2: ClassTag](other: RDD[(VertexId, U)])
-      (f: (VertexId, VD, U) => VD2): VertexRDD[VD2] = {
-    // Test if the other vertex is a VertexRDD to choose the optimal join strategy.
-    // If the other set is a VertexRDD then we use the much more efficient innerZipJoin
-    other match {
-      case other: VertexRDD[_] =>
-        innerZipJoin(other)(f)
-      case _ =>
-        new VertexRDD(
-          partitionsRDD.zipPartitions(
-            other.partitionBy(this.partitioner.get), preservesPartitioning = true)
-          { (part, msgs) =>
-            val vertexPartition: VertexPartition[VD] = part.next()
-            Iterator(vertexPartition.innerJoin(msgs)(f))
-          }
-        )
-    }
-  }
+      (f: (VertexId, VD, U) => VD2): VertexRDD[VD2]
 
   /**
    * Aggregates vertices in `messages` that have the same ids using `reduceFunc`, returning a
@@ -281,14 +224,37 @@ class VertexRDD[@specialized VD: ClassTag](
    * messages.
    */
   def aggregateUsingIndex[VD2: ClassTag](
-      messages: RDD[(VertexId, VD2)], reduceFunc: (VD2, VD2) => VD2): VertexRDD[VD2] = {
-    val shuffled = MsgRDDFunctions.partitionForAggregation(messages, this.partitioner.get)
-    val parts = partitionsRDD.zipPartitions(shuffled, true) { (thisIter, msgIter) =>
-      val vertexPartition: VertexPartition[VD] = thisIter.next()
-      Iterator(vertexPartition.aggregateUsingIndex(msgIter, reduceFunc))
-    }
-    new VertexRDD[VD2](parts)
-  }
+      messages: RDD[(VertexId, VD2)], reduceFunc: (VD2, VD2) => VD2): VertexRDD[VD2]
+
+  /**
+   * Returns a new `VertexRDD` reflecting a reversal of all edge directions in the corresponding
+   * [[EdgeRDD]].
+   */
+  def reverseRoutingTables(): VertexRDD[VD]
+
+  /** Prepares this VertexRDD for efficient joins with the given EdgeRDD. */
+  def withEdges(edges: EdgeRDD[_]): VertexRDD[VD]
+
+  /** Replaces the vertex partitions while preserving all other properties of the VertexRDD. */
+  private[graphx] def withPartitionsRDD[VD2: ClassTag](
+      partitionsRDD: RDD[ShippableVertexPartition[VD2]]): VertexRDD[VD2]
+
+  /**
+   * Changes the target storage level while preserving all other properties of the
+   * VertexRDD. Operations on the returned VertexRDD will preserve this storage level.
+   *
+   * This does not actually trigger a cache; to do this, call
+   * [[org.apache.spark.graphx.VertexRDD#cache]] on the returned VertexRDD.
+   */
+  private[graphx] def withTargetStorageLevel(
+      targetStorageLevel: StorageLevel): VertexRDD[VD]
+
+  /** Generates an RDD of vertex attributes suitable for shipping to the edge partitions. */
+  private[graphx] def shipVertexAttributes(
+      shipSrc: Boolean, shipDst: Boolean): RDD[(PartitionID, VertexAttributeBlock[VD])]
+
+  /** Generates an RDD of vertex IDs suitable for shipping to the edge partitions. */
+  private[graphx] def shipVertexIds(): RDD[(PartitionID, Array[VertexId])]
 
 } // end of VertexRDD
 
@@ -299,52 +265,101 @@ class VertexRDD[@specialized VD: ClassTag](
 object VertexRDD {
 
   /**
-   * Construct a `VertexRDD` from an RDD of vertex-attribute pairs.
-   * Duplicate entries are removed arbitrarily.
+   * Constructs a standalone `VertexRDD` (one that is not set up for efficient joins with an
+   * [[EdgeRDD]]) from an RDD of vertex-attribute pairs. Duplicate entries are removed arbitrarily.
    *
    * @tparam VD the vertex attribute type
    *
-   * @param rdd the collection of vertex-attribute pairs
+   * @param vertices the collection of vertex-attribute pairs
    */
-  def apply[VD: ClassTag](rdd: RDD[(VertexId, VD)]): VertexRDD[VD] = {
-    val partitioned: RDD[(VertexId, VD)] = rdd.partitioner match {
-      case Some(p) => rdd
-      case None => rdd.partitionBy(new HashPartitioner(rdd.partitions.size))
+  def apply[VD: ClassTag](vertices: RDD[(VertexId, VD)]): VertexRDD[VD] = {
+    val vPartitioned: RDD[(VertexId, VD)] = vertices.partitioner match {
+      case Some(p) => vertices
+      case None => vertices.partitionBy(new HashPartitioner(vertices.partitions.length))
     }
-    val vertexPartitions = partitioned.mapPartitions(
-      iter => Iterator(VertexPartition(iter)),
+    val vertexPartitions = vPartitioned.mapPartitions(
+      iter => Iterator(ShippableVertexPartition(iter)),
       preservesPartitioning = true)
-    new VertexRDD(vertexPartitions)
+    new VertexRDDImpl(vertexPartitions)
   }
 
   /**
-   * Constructs a `VertexRDD` from an RDD of vertex-attribute pairs, merging duplicates using
-   * `mergeFunc`.
+   * Constructs a `VertexRDD` from an RDD of vertex-attribute pairs. Duplicate vertex entries are
+   * removed arbitrarily. The resulting `VertexRDD` will be joinable with `edges`, and any missing
+   * vertices referred to by `edges` will be created with the attribute `defaultVal`.
    *
    * @tparam VD the vertex attribute type
    *
-   * @param rdd the collection of vertex-attribute pairs
-   * @param mergeFunc the associative, commutative merge function.
+   * @param vertices the collection of vertex-attribute pairs
+   * @param edges the [[EdgeRDD]] that these vertices may be joined with
+   * @param defaultVal the vertex attribute to use when creating missing vertices
    */
-  def apply[VD: ClassTag](rdd: RDD[(VertexId, VD)], mergeFunc: (VD, VD) => VD): VertexRDD[VD] = {
-    val partitioned: RDD[(VertexId, VD)] = rdd.partitioner match {
-      case Some(p) => rdd
-      case None => rdd.partitionBy(new HashPartitioner(rdd.partitions.size))
-    }
-    val vertexPartitions = partitioned.mapPartitions(
-      iter => Iterator(VertexPartition(iter)),
-      preservesPartitioning = true)
-    new VertexRDD(vertexPartitions)
+  def apply[VD: ClassTag](
+      vertices: RDD[(VertexId, VD)], edges: EdgeRDD[_], defaultVal: VD): VertexRDD[VD] = {
+    VertexRDD(vertices, edges, defaultVal, (a, b) => a)
   }
 
   /**
-   * Constructs a VertexRDD from the vertex IDs in `vids`, taking attributes from `rdd` and using
-   * `defaultVal` otherwise.
+   * Constructs a `VertexRDD` from an RDD of vertex-attribute pairs. Duplicate vertex entries are
+   * merged using `mergeFunc`. The resulting `VertexRDD` will be joinable with `edges`, and any
+   * missing vertices referred to by `edges` will be created with the attribute `defaultVal`.
+   *
+   * @tparam VD the vertex attribute type
+   *
+   * @param vertices the collection of vertex-attribute pairs
+   * @param edges the [[EdgeRDD]] that these vertices may be joined with
+   * @param defaultVal the vertex attribute to use when creating missing vertices
+   * @param mergeFunc the commutative, associative duplicate vertex attribute merge function
    */
-  def apply[VD: ClassTag](vids: RDD[VertexId], rdd: RDD[(VertexId, VD)], defaultVal: VD)
-    : VertexRDD[VD] = {
-    VertexRDD(vids.map(vid => (vid, defaultVal))).leftJoin(rdd) { (vid, default, value) =>
-      value.getOrElse(default)
+  def apply[VD: ClassTag](
+      vertices: RDD[(VertexId, VD)], edges: EdgeRDD[_], defaultVal: VD, mergeFunc: (VD, VD) => VD
+    ): VertexRDD[VD] = {
+    val vPartitioned: RDD[(VertexId, VD)] = vertices.partitioner match {
+      case Some(p) => vertices
+      case None => vertices.partitionBy(new HashPartitioner(vertices.partitions.length))
     }
+    val routingTables = createRoutingTables(edges, vPartitioned.partitioner.get)
+    val vertexPartitions = vPartitioned.zipPartitions(routingTables, preservesPartitioning = true) {
+      (vertexIter, routingTableIter) =>
+        val routingTable =
+          if (routingTableIter.hasNext) routingTableIter.next() else RoutingTablePartition.empty
+        Iterator(ShippableVertexPartition(vertexIter, routingTable, defaultVal, mergeFunc))
+    }
+    new VertexRDDImpl(vertexPartitions)
+  }
+
+  /**
+   * Constructs a `VertexRDD` containing all vertices referred to in `edges`. The vertices will be
+   * created with the attribute `defaultVal`. The resulting `VertexRDD` will be joinable with
+   * `edges`.
+   *
+   * @tparam VD the vertex attribute type
+   *
+   * @param edges the [[EdgeRDD]] referring to the vertices to create
+   * @param numPartitions the desired number of partitions for the resulting `VertexRDD`
+   * @param defaultVal the vertex attribute to use when creating missing vertices
+   */
+  def fromEdges[VD: ClassTag](
+      edges: EdgeRDD[_], numPartitions: Int, defaultVal: VD): VertexRDD[VD] = {
+    val routingTables = createRoutingTables(edges, new HashPartitioner(numPartitions))
+    val vertexPartitions = routingTables.mapPartitions({ routingTableIter =>
+      val routingTable =
+        if (routingTableIter.hasNext) routingTableIter.next() else RoutingTablePartition.empty
+      Iterator(ShippableVertexPartition(Iterator.empty, routingTable, defaultVal))
+    }, preservesPartitioning = true)
+    new VertexRDDImpl(vertexPartitions)
+  }
+
+  private[graphx] def createRoutingTables(
+      edges: EdgeRDD[_], vertexPartitioner: Partitioner): RDD[RoutingTablePartition] = {
+    // Determine which vertices each edge partition needs by creating a mapping from vid to pid.
+    val vid2pid = edges.partitionsRDD.mapPartitions(_.flatMap(
+      Function.tupled(RoutingTablePartition.edgePartitionToMsgs)))
+      .setName("VertexRDD.createRoutingTables - vid2pid (aggregation)")
+
+    val numEdgePartitions = edges.partitions.length
+    vid2pid.partitionBy(vertexPartitioner).mapPartitions(
+      iter => Iterator(RoutingTablePartition.fromMsgs(numEdgePartitions, iter)),
+      preservesPartitioning = true)
   }
 }

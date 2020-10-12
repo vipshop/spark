@@ -21,38 +21,48 @@ import javax.servlet.http.HttpServletRequest
 
 import scala.xml.Node
 
-import org.apache.spark.scheduler.{Schedulable, StageInfo}
-import org.apache.spark.ui.Page._
-import org.apache.spark.ui.UIUtils
+import org.apache.spark.status.PoolData
+import org.apache.spark.ui.{UIUtils, WebUIPage}
 
 /** Page showing specific pool details */
-private[ui] class PoolPage(parent: JobProgressUI) {
-  private val appName = parent.appName
-  private val basePath = parent.basePath
-  private val live = parent.live
-  private val sc = parent.sc
-  private lazy val listener = parent.listener
+private[ui] class PoolPage(parent: StagesTab) extends WebUIPage("pool") {
 
   def render(request: HttpServletRequest): Seq[Node] = {
-    listener.synchronized {
-      val poolName = request.getParameter("poolname")
-      val poolToActiveStages = listener.poolToActiveStages
-      val activeStages = poolToActiveStages.get(poolName) match {
-        case Some(s) => s.values.toSeq
-        case None => Seq[StageInfo]()
-      }
-      val activeStagesTable = new StageTable(activeStages.sortBy(_.submissionTime).reverse, parent)
-
-      // For now, pool information is only accessible in live UIs
-      val pools = if (live) Seq(sc.getPoolForName(poolName).get) else Seq[Schedulable]()
-      val poolTable = new PoolTable(pools, parent)
-
-      val content =
-        <h4>Summary </h4> ++ poolTable.toNodeSeq ++
-        <h4>{activeStages.size} Active Stages</h4> ++ activeStagesTable.toNodeSeq
-
-      UIUtils.headerSparkPage(
-        content, basePath, appName, "Fair Scheduler Pool: " + poolName, Stages)
+    val poolName = Option(request.getParameter("poolname")).map { poolname =>
+      UIUtils.decodeURLParameter(poolname)
+    }.getOrElse {
+      throw new IllegalArgumentException(s"Missing poolname parameter")
     }
+
+    // For now, pool information is only accessible in live UIs
+    val pool = parent.sc.flatMap(_.getPoolForName(poolName)).getOrElse {
+      throw new IllegalArgumentException(s"Unknown pool: $poolName")
+    }
+
+    val uiPool = parent.store.asOption(parent.store.pool(poolName)).getOrElse(
+      new PoolData(poolName, Set()))
+    val activeStages = uiPool.stageIds.toSeq.map(parent.store.lastStageAttempt(_))
+    val activeStagesTable =
+      new StageTableBase(parent.store, request, activeStages, "", "activeStage", parent.basePath,
+        "stages/pool", parent.isFairScheduler, parent.killEnabled, false)
+
+    val poolTable = new PoolTable(Map(pool -> uiPool), parent)
+    var content = <h4>Summary </h4> ++ poolTable.toNodeSeq(request)
+    if (activeStages.nonEmpty) {
+      content ++=
+        <span class="collapse-aggregated-poolActiveStages collapse-table"
+            onClick="collapseTable('collapse-aggregated-poolActiveStages',
+            'aggregated-poolActiveStages')">
+          <h4>
+            <span class="collapse-table-arrow arrow-open"></span>
+            <a>Active Stages ({activeStages.size})</a>
+          </h4>
+        </span> ++
+        <div class="aggregated-poolActiveStages collapsible-table">
+          {activeStagesTable.toNodeSeq}
+        </div>
+    }
+
+    UIUtils.headerSparkPage(request, "Fair Scheduler Pool: " + poolName, content, parent)
   }
 }

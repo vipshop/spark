@@ -17,25 +17,29 @@
 
 package org.apache.spark.streaming.dstream
 
-import org.apache.spark.streaming.StreamingContext
-import org.apache.spark.storage.StorageLevel
-import org.apache.spark.util.NextIterator
+import java.io._
+import java.net.{ConnectException, Socket}
+import java.nio.charset.StandardCharsets
 
 import scala.reflect.ClassTag
+import scala.util.control.NonFatal
 
-import java.io._
-import java.net.Socket
+import org.apache.spark.internal.Logging
+import org.apache.spark.storage.StorageLevel
+import org.apache.spark.streaming.StreamingContext
+import org.apache.spark.streaming.receiver.Receiver
+import org.apache.spark.util.NextIterator
 
 private[streaming]
 class SocketInputDStream[T: ClassTag](
-    @transient ssc_ : StreamingContext,
+    _ssc: StreamingContext,
     host: String,
     port: Int,
     bytesToObjects: InputStream => Iterator[T],
     storageLevel: StorageLevel
-  ) extends NetworkInputDStream[T](ssc_) {
+  ) extends ReceiverInputDStream[T](_ssc) {
 
-  def getReceiver(): NetworkReceiver[T] = {
+  def getReceiver(): Receiver[T] = {
     new SocketReceiver(host, port, bytesToObjects, storageLevel)
   }
 }
@@ -46,28 +50,60 @@ class SocketReceiver[T: ClassTag](
     port: Int,
     bytesToObjects: InputStream => Iterator[T],
     storageLevel: StorageLevel
-  ) extends NetworkReceiver[T] {
+  ) extends Receiver[T](storageLevel) with Logging {
 
-  lazy protected val blockGenerator = new BlockGenerator(storageLevel)
+  private var socket: Socket = _
 
-  override def getLocationPreference = None
+  def onStart(): Unit = {
 
-  protected def onStart() {
-    logInfo("Connecting to " + host + ":" + port)
-    val socket = new Socket(host, port)
-    logInfo("Connected to " + host + ":" + port)
-    blockGenerator.start()
-    val iterator = bytesToObjects(socket.getInputStream())
-    while(iterator.hasNext) {
-      val obj = iterator.next
-      blockGenerator += obj
+    logInfo(s"Connecting to $host:$port")
+    try {
+      socket = new Socket(host, port)
+    } catch {
+      case e: ConnectException =>
+        restart(s"Error connecting to $host:$port", e)
+        return
+    }
+    logInfo(s"Connected to $host:$port")
+
+    // Start the thread that receives data over a connection
+    new Thread("Socket Receiver") {
+      setDaemon(true)
+      override def run(): Unit = { receive() }
+    }.start()
+  }
+
+  def onStop(): Unit = {
+    // in case restart thread close it twice
+    synchronized {
+      if (socket != null) {
+        socket.close()
+        socket = null
+        logInfo(s"Closed socket to $host:$port")
+      }
     }
   }
 
-  protected def onStop() {
-    blockGenerator.stop()
+  /** Create a socket connection and receive data until receiver is stopped */
+  def receive(): Unit = {
+    try {
+      val iterator = bytesToObjects(socket.getInputStream())
+      while(!isStopped && iterator.hasNext) {
+        store(iterator.next())
+      }
+      if (!isStopped()) {
+        restart("Socket data stream had no more data")
+      } else {
+        logInfo("Stopped receiving")
+      }
+    } catch {
+      case NonFatal(e) =>
+        logWarning("Error receiving data", e)
+        restart("Error receiving data", e)
+    } finally {
+      onStop()
+    }
   }
-
 }
 
 private[streaming]
@@ -78,7 +114,8 @@ object SocketReceiver  {
    * to '\n' delimited strings and returns an iterator to access the strings.
    */
   def bytesToLines(inputStream: InputStream): Iterator[String] = {
-    val dataInputStream = new BufferedReader(new InputStreamReader(inputStream, "UTF-8"))
+    val dataInputStream = new BufferedReader(
+      new InputStreamReader(inputStream, StandardCharsets.UTF_8))
     new NextIterator[String] {
       protected override def getNext() = {
         val nextValue = dataInputStream.readLine()
@@ -88,7 +125,7 @@ object SocketReceiver  {
         nextValue
       }
 
-      protected override def close() {
+      protected override def close(): Unit = {
         dataInputStream.close()
       }
     }

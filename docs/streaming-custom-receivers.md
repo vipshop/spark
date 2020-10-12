@@ -1,128 +1,271 @@
 ---
 layout: global
 title: Spark Streaming Custom Receivers
+license: |
+  Licensed to the Apache Software Foundation (ASF) under one or more
+  contributor license agreements.  See the NOTICE file distributed with
+  this work for additional information regarding copyright ownership.
+  The ASF licenses this file to You under the Apache License, Version 2.0
+  (the "License"); you may not use this file except in compliance with
+  the License.  You may obtain a copy of the License at
+ 
+     http://www.apache.org/licenses/LICENSE-2.0
+ 
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
 ---
 
-A "Spark Streaming" receiver can be a simple network stream, streams of messages from a message queue, files etc. A receiver can also assume roles more than just receiving data like filtering, preprocessing, to name a few of the possibilities. The api to plug-in any user defined custom receiver is thus provided to encourage development of receivers which may be well suited to ones specific need.
+Spark Streaming can receive streaming data from any arbitrary data source beyond
+the ones for which it has built-in support (that is, beyond Kafka, Kinesis, files, sockets, etc.).
+This requires the developer to implement a *receiver* that is customized for receiving data from
+the concerned data source. This guide walks through the process of implementing a custom receiver
+and using it in a Spark Streaming application. Note that custom receivers can be implemented
+in Scala or Java.
 
-This guide shows the programming model and features by walking through a simple sample receiver and corresponding Spark Streaming application.
+## Implementing a Custom Receiver
 
-### Writing a Simple Receiver
+This starts with implementing a **Receiver**
+([Scala doc](api/scala/org/apache/spark/streaming/receiver/Receiver.html),
+[Java doc](api/java/org/apache/spark/streaming/receiver/Receiver.html)).
+A custom receiver must extend this abstract class by implementing two methods
 
-This starts with implementing [NetworkReceiver](api/streaming/index.html#org.apache.spark.streaming.dstream.NetworkReceiver).
+- `onStart()`: Things to do to start receiving data.
+- `onStop()`: Things to do to stop receiving data.
 
-The following is a simple socket text-stream receiver.
+Both `onStart()` and `onStop()` must not block indefinitely. Typically, `onStart()` would start the threads
+that are responsible for receiving the data, and `onStop()` would ensure that these threads receiving the data
+are stopped. The receiving threads can also use `isStopped()`, a `Receiver` method, to check whether they
+should stop receiving data.
 
-{% highlight scala %}
-       class SocketTextStreamReceiver(host: String, port: Int)
-         extends NetworkReceiver[String]
-       {
-         protected lazy val blocksGenerator: BlockGenerator =
-           new BlockGenerator(StorageLevel.MEMORY_ONLY_SER_2)
+Once the data is received, that data can be stored inside Spark
+by calling `store(data)`, which is a method provided by the Receiver class.
+There are a number of flavors of `store()` which allow one to store the received data
+record-at-a-time or as whole collection of objects / serialized bytes. Note that the flavor of
+`store()` used to implement a receiver affects its reliability and fault-tolerance semantics.
+This is discussed [later](#receiver-reliability) in more detail.
 
-         protected def onStart() = {
-           blocksGenerator.start()
-           val socket = new Socket(host, port)
-           val dataInputStream = new BufferedReader(new InputStreamReader(socket.getInputStream(), "UTF-8"))
-           var data: String = dataInputStream.readLine()
-           while (data != null) {
-             blocksGenerator += data
-             data = dataInputStream.readLine()
-           }
-         }
+Any exception in the receiving threads should be caught and handled properly to avoid silent
+failures of the receiver. `restart(<exception>)` will restart the receiver by
+asynchronously calling `onStop()` and then calling `onStart()` after a delay.
+`stop(<exception>)` will call `onStop()` and terminate the receiver. Also, `reportError(<error>)`
+reports an error message to the driver (visible in the logs and UI) without stopping / restarting
+the receiver.
 
-         protected def onStop() {
-           blocksGenerator.stop()
-         }
-       }
-{% endhighlight %}
+The following is a custom receiver that receives a stream of text over a socket. It treats
+'\n' delimited lines in the text stream as records and stores them with Spark. If the receiving thread
+has any error connecting or receiving, the receiver is restarted to make another attempt to connect.
 
-
-All we did here is extended NetworkReceiver and called blockGenerator's API method (i.e. +=) to push our blocks of data. Please refer to scala-docs of NetworkReceiver for more details.
-
-
-### An Actor as Receiver
-
-This starts with implementing [Actor](#References)
-
-Following is a simple socket text-stream receiver, which is appearently overly simplified using Akka's socket.io api.
-
-{% highlight scala %}
-       class SocketTextStreamReceiver (host:String,
-         port:Int,
-         bytesToString: ByteString => String) extends Actor with Receiver {
-
-          override def preStart = IOManager(context.system).connect(host, port)
-
-          def receive = {
-           case IO.Read(socket, bytes) => pushBlock(bytesToString(bytes))
-         }
-
-       }
-{% endhighlight %}
-
-All we did here is mixed in trait Receiver and called pushBlock api method to push our blocks of data. Please refer to scala-docs of Receiver for more details.
-
-### A Sample Spark Application
-
-* First create a Spark streaming context with master url and batchduration.
+<div class="codetabs">
+<div data-lang="scala"  markdown="1" >
 
 {% highlight scala %}
-    val ssc = new StreamingContext(master, "WordCountCustomStreamSource",
-      Seconds(batchDuration))
+
+class CustomReceiver(host: String, port: Int)
+  extends Receiver[String](StorageLevel.MEMORY_AND_DISK_2) with Logging {
+
+  def onStart() {
+    // Start the thread that receives data over a connection
+    new Thread("Socket Receiver") {
+      override def run() { receive() }
+    }.start()
+  }
+
+  def onStop() {
+    // There is nothing much to do as the thread calling receive()
+    // is designed to stop by itself if isStopped() returns false
+  }
+
+  /** Create a socket connection and receive data until receiver is stopped */
+  private def receive() {
+    var socket: Socket = null
+    var userInput: String = null
+    try {
+      // Connect to host:port
+      socket = new Socket(host, port)
+
+      // Until stopped or connection broken continue reading
+      val reader = new BufferedReader(
+        new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))
+      userInput = reader.readLine()
+      while(!isStopped && userInput != null) {
+        store(userInput)
+        userInput = reader.readLine()
+      }
+      reader.close()
+      socket.close()
+
+      // Restart in an attempt to connect again when server is active again
+      restart("Trying to connect again")
+    } catch {
+      case e: java.net.ConnectException =>
+        // restart if could not connect to server
+        restart("Error connecting to " + host + ":" + port, e)
+      case t: Throwable =>
+        // restart if there is any other error
+        restart("Error receiving data", t)
+    }
+  }
+}
+
 {% endhighlight %}
 
-* Plug-in the custom receiver into the spark streaming context and create a DStream.
+</div>
+<div data-lang="java" markdown="1">
+
+{% highlight java %}
+
+public class JavaCustomReceiver extends Receiver<String> {
+
+  String host = null;
+  int port = -1;
+
+  public JavaCustomReceiver(String host_ , int port_) {
+    super(StorageLevel.MEMORY_AND_DISK_2());
+    host = host_;
+    port = port_;
+  }
+
+  @Override
+  public void onStart() {
+    // Start the thread that receives data over a connection
+    new Thread(this::receive).start();
+  }
+
+  @Override
+  public void onStop() {
+    // There is nothing much to do as the thread calling receive()
+    // is designed to stop by itself if isStopped() returns false
+  }
+
+  /** Create a socket connection and receive data until receiver is stopped */
+  private void receive() {
+    Socket socket = null;
+    String userInput = null;
+
+    try {
+      // connect to the server
+      socket = new Socket(host, port);
+
+      BufferedReader reader = new BufferedReader(
+        new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+
+      // Until stopped or connection broken continue reading
+      while (!isStopped() && (userInput = reader.readLine()) != null) {
+        System.out.println("Received data '" + userInput + "'");
+        store(userInput);
+      }
+      reader.close();
+      socket.close();
+
+      // Restart in an attempt to connect again when server is active again
+      restart("Trying to connect again");
+    } catch(ConnectException ce) {
+      // restart if could not connect to server
+      restart("Could not connect", ce);
+    } catch(Throwable t) {
+      // restart if there is any other error
+      restart("Error receiving data", t);
+    }
+  }
+}
+
+{% endhighlight %}
+
+</div>
+</div>
+
+
+## Using the custom receiver in a Spark Streaming application
+
+The custom receiver can be used in a Spark Streaming application by using
+`streamingContext.receiverStream(<instance of custom receiver>)`. This will create
+an input DStream using data received by the instance of custom receiver, as shown below:
+
+<div class="codetabs">
+<div data-lang="scala"  markdown="1" >
 
 {% highlight scala %}
-    val lines = ssc.networkStream[String](new SocketTextStreamReceiver(
-      "localhost", 8445))
+// Assuming ssc is the StreamingContext
+val customReceiverStream = ssc.receiverStream(new CustomReceiver(host, port))
+val words = customReceiverStream.flatMap(_.split(" "))
+...
 {% endhighlight %}
 
-* OR Plug-in the actor as receiver into the spark streaming context and create a DStream.
+The full source code is in the example [CustomReceiver.scala]({{site.SPARK_GITHUB_URL}}/blob/v{{site.SPARK_VERSION_SHORT}}/examples/src/main/scala/org/apache/spark/examples/streaming/CustomReceiver.scala).
 
-{% highlight scala %}
-    val lines = ssc.actorStream[String](Props(new SocketTextStreamReceiver(
-      "localhost",8445, z => z.utf8String)),"SocketReceiver")
+</div>
+<div data-lang="java" markdown="1">
+
+{% highlight java %}
+// Assuming ssc is the JavaStreamingContext
+JavaDStream<String> customReceiverStream = ssc.receiverStream(new JavaCustomReceiver(host, port));
+JavaDStream<String> words = customReceiverStream.flatMap(s -> ...);
+...
 {% endhighlight %}
 
-* Process it.
+The full source code is in the example [JavaCustomReceiver.java]({{site.SPARK_GITHUB_URL}}/blob/v{{site.SPARK_VERSION_SHORT}}/examples/src/main/java/org/apache/spark/examples/streaming/JavaCustomReceiver.java).
 
-{% highlight scala %}
-    val words = lines.flatMap(_.split(" "))
-    val wordCounts = words.map(x => (x, 1)).reduceByKey(_ + _)
+</div>
+</div>
 
-    wordCounts.print()
-    ssc.start()
-{% endhighlight %}
+## Receiver Reliability
+As discussed in brief in the
+[Spark Streaming Programming Guide](streaming-programming-guide.html#receiver-reliability),
+there are two kinds of receivers based on their reliability and fault-tolerance semantics.
 
-* After processing it, stream can be tested using the netcat utility.
+1. *Reliable Receiver* - For *reliable sources* that allow sent data to be acknowledged, a
+  *reliable receiver* correctly acknowledges to the source that the data has been received
+  and stored in Spark reliably (that is, replicated successfully). Usually,
+  implementing this receiver involves careful consideration of the semantics of source
+  acknowledgements.
+1. *Unreliable Receiver* - An *unreliable receiver* does *not* send acknowledgement to a source. This can be used for sources that do not support acknowledgement, or even for reliable sources when one does not want or need to go into the complexity of acknowledgement.
 
-     $ nc -l localhost 8445
-     hello world
-     hello hello
+To implement a *reliable receiver*, you have to use `store(multiple-records)` to store data.
+This flavor of `store` is a blocking call which returns only after all the given records have
+been stored inside Spark. If the receiver's configured storage level uses replication
+(enabled by default), then this call returns after replication has completed.
+Thus it ensures that the data is reliably stored, and the receiver can now acknowledge the
+source appropriately. This ensures that no data is lost when the receiver fails in the middle
+of replicating data -- the buffered data will not be acknowledged and hence will be later resent
+by the source.
 
+An *unreliable receiver* does not have to implement any of this logic. It can simply receive
+records from the source and insert them one-at-a-time using `store(single-record)`. While it does
+not get the reliability guarantees of `store(multiple-records)`, it has the following advantages:
 
-## Multiple Homogeneous/Heterogeneous Receivers.
+- The system takes care of chunking that data into appropriate sized blocks (look for block
+interval in the [Spark Streaming Programming Guide](streaming-programming-guide.html)).
+- The system takes care of controlling the receiving rates if the rate limits have been specified.
+- Because of these two, unreliable receivers are simpler to implement than reliable receivers.
 
-A DStream union operation is provided for taking union on multiple input streams.
+The following table summarizes the characteristics of both types of receivers
 
-{% highlight scala %}
-    val lines = ssc.actorStream[String](Props(new SocketTextStreamReceiver(
-      "localhost",8445, z => z.utf8String)),"SocketReceiver")
-
-    // Another socket stream receiver
-    val lines2 = ssc.actorStream[String](Props(new SocketTextStreamReceiver(
-      "localhost",8446, z => z.utf8String)),"SocketReceiver")
-
-    val union = lines.union(lines2)
-{% endhighlight %}
-
-Above stream can be easily process as described earlier.
-
-_A more comprehensive example is provided in the spark streaming examples_
-
-## References
-
-1.[Akka Actor documentation](http://doc.akka.io/docs/akka/2.0.5/scala/actors.html)
-2.[NetworkReceiver](api/streaming/index.html#org.apache.spark.streaming.dstream.NetworkReceiver)
+<table class="table">
+<tr>
+  <th>Receiver Type</th>
+  <th>Characteristics</th>
+</tr>
+<tr>
+  <td><b>Unreliable Receivers</b></td>
+  <td>
+    Simple to implement.<br>
+    System takes care of block generation and rate control.
+    No fault-tolerance guarantees, can lose data on receiver failure.
+  </td>
+</tr>
+<tr>
+  <td><b>Reliable Receivers</b></td>
+  <td>
+    Strong fault-tolerance guarantees, can ensure zero data loss.<br/>
+    Block generation and rate control to be handled by the receiver implementation.<br/>
+    Implementation complexity depends on the acknowledgement mechanisms of the source.
+  </td>
+</tr>
+<tr>
+  <td></td>
+  <td></td>
+</tr>
+</table>
